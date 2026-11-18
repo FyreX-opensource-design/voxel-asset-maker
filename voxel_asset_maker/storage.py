@@ -12,11 +12,24 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .model import BLEND_MODES, Document, Layer, ScriptBinding, refit, validate_size
+from .model import (
+    BLEND_MODES,
+    CTM_SHEET,
+    TILE,
+    BlockTraits,
+    CropTraits,
+    Document,
+    Fluorescence,
+    Layer,
+    ScriptBinding,
+    empty_pixels,
+    refit,
+    validate_size,
+)
 from .processors import ScriptLibrary
 from .render import render_variant, stack_variant_count
 
-PROJECT_FORMAT = 1
+PROJECT_FORMAT = 2
 
 
 def png_bytes(arr: np.ndarray) -> bytes:
@@ -37,10 +50,47 @@ def save_project(doc: Document, path: Path) -> None:
     payload = {
         "format": PROJECT_FORMAT,
         "name": doc.name,
+        "kind": doc.kind,
         "width": doc.width,
         "height": doc.height,
         "active": doc.active_index,
         "palette": list(doc.palette),
+        "ctm": bool(doc.ctm),
+        "fluorescence": {
+            "enabled": bool(doc.fluor.enabled),
+            "mode": doc.fluor.mode,
+            "color": doc.fluor.color,
+            "start": int(doc.fluor.start),
+            "full": int(doc.fluor.full),
+            "strength": float(doc.fluor.strength),
+        },
+        "block": {
+            "shape": doc.traits.shape,
+            "tab": doc.traits.tab,
+            "hardness": doc.traits.hardness,
+            "tool": doc.traits.tool,
+            "mining_level": int(doc.traits.mining_level),
+            "sound": doc.traits.sound,
+            "render": doc.traits.render,
+            "solid": bool(doc.traits.solid),
+            "gravity": bool(doc.traits.gravity),
+            "light": int(doc.traits.light),
+            "full_block": doc.traits.full_block,
+        },
+        "crop": {
+            "stages": int(doc.crop.stages),
+            "min_time": doc.crop.min_time,
+            "max_time": doc.crop.max_time,
+            "needs_water": bool(doc.crop.needs_water),
+            "water_radius": int(doc.crop.water_radius),
+            "water_vertical": int(doc.crop.water_vertical),
+            "seeds": doc.crop.seeds,
+            "produce": doc.crop.produce,
+            "food": int(doc.crop.food),
+            "ground": doc.crop.ground,
+            "seed_tab": doc.crop.seed_tab,
+            "produce_tab": doc.crop.produce_tab,
+        },
         "layers": [
             {
                 "id": layer.id,
@@ -49,11 +99,8 @@ def save_project(doc: Document, path: Path) -> None:
                 "opacity": layer.opacity,
                 "blend": layer.blend,
                 "offset": [int(layer.offset[0]), int(layer.offset[1])],
-                "script": {
-                    "id": layer.script.script_id,
-                    "path": layer.script.script_path,
-                    "params": layer.script.params,
-                },
+                "script": _script_dict(layer.scripts[0]) if layer.scripts else _script_dict(None),
+                "scripts": [_script_dict(binding) for binding in layer.scripts if binding.script_id != "none"],
                 "file": f"layers/{index}.png",
             }
             for index, layer in enumerate(doc.layers)
@@ -65,6 +112,8 @@ def save_project(doc: Document, path: Path) -> None:
         archive.writestr("project.json", json.dumps(payload, indent=2))
         for index, layer in enumerate(doc.layers):
             archive.writestr(f"layers/{index}.png", png_bytes(layer.pixels))
+        archive.writestr("ctm.png", png_bytes(doc.ctm_pixels))
+        archive.writestr("fluorescence.png", png_bytes(doc.fluor.pixels))
     os.replace(tmp, path)
 
 
@@ -72,12 +121,21 @@ def load_project(path: Path) -> Document:
     path = Path(path)
     with zipfile.ZipFile(path, "r") as archive:
         payload = json.loads(archive.read("project.json"))
+        ctm_pixels = (
+            refit(array_from_png_bytes(archive.read("ctm.png")), CTM_SHEET[0], CTM_SHEET[1])
+            if "ctm.png" in archive.namelist()
+            else None
+        )
+        fluor_pixels = (
+            refit(array_from_png_bytes(archive.read("fluorescence.png")), TILE, TILE)
+            if "fluorescence.png" in archive.namelist()
+            else None
+        )
         layers: list[Layer] = []
         width, height = validate_size(payload["width"], payload["height"])
         for index, entry in enumerate(payload["layers"]):
             raw = archive.read(entry.get("file") or f"layers/{index}.png")
             pixels = refit(array_from_png_bytes(raw), width, height)
-            script = entry.get("script") or {}
             blend = entry.get("blend", "normal")
             if blend not in BLEND_MODES:
                 blend = "normal"
@@ -91,11 +149,7 @@ def load_project(path: Path) -> Document:
                     opacity=float(entry.get("opacity", 1.0)),
                     blend=blend,
                     offset=(int(offset[0]), int(offset[1])),
-                    script=ScriptBinding(
-                        script_id=str(script.get("id") or "none"),
-                        params=dict(script.get("params") or {}),
-                        script_path=str(script.get("path") or ""),
-                    ),
+                    scripts=_scripts_from_entry(entry),
                 )
             )
     doc = Document(
@@ -103,8 +157,14 @@ def load_project(path: Path) -> Document:
         height=height,
         name=str(payload.get("name") or path.stem),
         layers=layers,
+        kind=str(payload.get("kind") or "texture"),
         active_index=int(payload.get("active") or 0),
         palette=[str(color) for color in payload.get("palette") or []],
+        ctm=bool(payload.get("ctm", False)),
+        ctm_pixels=ctm_pixels if ctm_pixels is not None else _blank_ctm(),
+        fluor=_fluorescence_from_payload(payload.get("fluorescence"), fluor_pixels),
+        traits=_traits_from_payload(payload.get("block")),
+        crop=_crop_from_payload(payload.get("crop")),
     )
     return doc
 
@@ -175,8 +235,12 @@ def export_variant_zip(doc: Document, path: Path, library: ScriptLibrary) -> tup
                     "opacity": layer.opacity,
                     "blend": layer.blend,
                     "offset": [int(layer.offset[0]), int(layer.offset[1])],
-                    "script": layer.script.script_id,
-                    "params": layer.script.params,
+                    "script": layer.scripts[0].script_id if layer.scripts else "none",
+                    "scripts": [
+                        {"id": binding.script_id, "params": binding.params}
+                        for binding in layer.scripts
+                        if binding.script_id != "none"
+                    ],
                 }
                 for layer in doc.layers
             ],
@@ -184,6 +248,84 @@ def export_variant_zip(doc: Document, path: Path, library: ScriptLibrary) -> tup
         archive.writestr("manifest.json", json.dumps(manifest, indent=2))
     os.replace(tmp, path)
     return names, errors
+
+
+def _script_dict(binding: ScriptBinding | None) -> dict:
+    if binding is None or binding.script_id == "none":
+        return {"id": "none", "path": "", "params": {}}
+    return {"id": binding.script_id, "path": binding.script_path, "params": binding.params}
+
+
+def _scripts_from_entry(entry: dict) -> list[ScriptBinding]:
+    """Read the script stack. Older projects stored a single ``script`` object."""
+    if "scripts" in entry and isinstance(entry["scripts"], list):
+        bindings = [_binding_from_dict(item) for item in entry["scripts"] if isinstance(item, dict)]
+    else:
+        raw = entry.get("script") or {}
+        bindings = [_binding_from_dict(raw)] if isinstance(raw, dict) else []
+    return [binding for binding in bindings if binding.script_id and binding.script_id != "none"]
+
+
+def _binding_from_dict(raw: dict) -> ScriptBinding:
+    return ScriptBinding(
+        script_id=str(raw.get("id") or "none"),
+        params=dict(raw.get("params") or {}),
+        script_path=str(raw.get("path") or ""),
+    )
+
+
+def _blank_ctm() -> np.ndarray:
+    return empty_pixels(*CTM_SHEET)
+
+
+def _crop_from_payload(raw: object) -> CropTraits:
+    if not isinstance(raw, dict):
+        return CropTraits()
+    return CropTraits(
+        stages=int(raw.get("stages", 4)),
+        min_time=float(raw.get("min_time", 180.0)),
+        max_time=float(raw.get("max_time", 340.0)),
+        needs_water=bool(raw.get("needs_water", True)),
+        water_radius=int(raw.get("water_radius", 4)),
+        water_vertical=int(raw.get("water_vertical", 1)),
+        seeds=str(raw.get("seeds") or ""),
+        produce=str(raw.get("produce") or ""),
+        food=int(raw.get("food", 0)),
+        ground=str(raw.get("ground") or "farmland"),
+        seed_tab=str(raw.get("seed_tab") or "natural"),
+        produce_tab=str(raw.get("produce_tab") or "materials"),
+    )
+
+
+def _traits_from_payload(raw: object) -> BlockTraits:
+    if not isinstance(raw, dict):
+        return BlockTraits()
+    return BlockTraits(
+        shape=str(raw.get("shape") or "cube"),
+        tab=str(raw.get("tab") or "building"),
+        hardness=float(raw.get("hardness", 1.0)),
+        tool=str(raw.get("tool") or "pickaxe"),
+        mining_level=int(raw.get("mining_level", 0)),
+        sound=str(raw.get("sound") or "stone"),
+        render=str(raw.get("render") or "solid"),
+        solid=bool(raw.get("solid", True)),
+        gravity=bool(raw.get("gravity", False)),
+        light=int(raw.get("light", 0)),
+        full_block=str(raw.get("full_block") or ""),
+    )
+
+
+def _fluorescence_from_payload(raw: object, pixels: np.ndarray | None) -> Fluorescence:
+    data = raw if isinstance(raw, dict) else {}
+    return Fluorescence(
+        enabled=bool(data.get("enabled", False)),
+        mode=str(data.get("mode") or "texture"),
+        color=str(data.get("color") or "#9dff57"),
+        start=int(data.get("start", 1) or 0),
+        full=int(data.get("full", 8) or 0),
+        strength=float(data.get("strength", 1) or 0),
+        pixels=pixels if pixels is not None else empty_pixels(TILE, TILE),
+    )
 
 
 def _pad_dim(value: int) -> int:

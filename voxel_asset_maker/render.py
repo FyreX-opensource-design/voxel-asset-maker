@@ -10,7 +10,7 @@ from PIL import Image
 from . import bootstrap  # noqa: F401
 import texture_layer
 
-from .model import Document, Layer
+from .model import Document, Layer, mask_block_faces
 from .processors import (
     ProcessError,
     Processor,
@@ -30,12 +30,14 @@ class RenderResult:
 
 
 def variant_sources(doc: Document, library: ScriptLibrary) -> list[tuple[str, int]]:
-    """Layers whose script count is above 1, in stack order."""
+    """Scripts whose count is above 1, in layer order then script order."""
     sources: list[tuple[str, int]] = []
     for layer in doc.layers:
-        count = _layer_count(layer, library)
-        if count > 1:
-            sources.append((layer.name, count))
+        for binding in layer.scripts:
+            count = _binding_count(binding, library)
+            if count > 1:
+                label = library.get(binding.script_id).label
+                sources.append((f"{layer.name} · {label}", count))
     return sources
 
 
@@ -59,7 +61,12 @@ def render_variant(doc: Document, export_index: int, library: ScriptLibrary) -> 
         processed, error = _process_layer(layer, doc, export_index, export_count, library)
         if error:
             errors.append(error)
-        placed = place(processed, doc.width, doc.height, layer.offset, layer.opacity)
+        if doc.kind == "block":
+            processed = mask_block_faces(processed)
+            offset = (0, 0)
+        else:
+            offset = layer.offset
+        placed = place(processed, doc.width, doc.height, offset, layer.opacity)
         if acc is None:
             acc = placed
         else:
@@ -104,11 +111,39 @@ def _process_layer(
     export_count: int,
     library: ScriptLibrary,
 ) -> tuple[np.ndarray, str | None]:
-    proc = library.get(layer.script.script_id)
-    if layer.script.script_id != "none" and not library.known(layer.script.script_id):
-        return layer.pixels.copy(), f"{layer.name}: missing script {layer.script.script_id}"
+    """Run this layer's scripts from first to last. Each sees the previous result."""
+    pixels = layer.pixels
+    errors: list[str] = []
+    ran = False
+    for binding in layer.scripts:
+        if not binding.script_id or binding.script_id == "none":
+            continue
+        ran = True
+        pixels, error = _apply_binding(
+            pixels, binding, layer, doc, export_index, export_count, library
+        )
+        if error:
+            errors.append(error)
+    if not ran:
+        return np.array(layer.pixels, copy=True), None
+    return pixels, "\n".join(errors) if errors else None
+
+
+def _apply_binding(
+    pixels: np.ndarray,
+    binding,
+    layer: Layer,
+    doc: Document,
+    export_index: int,
+    export_count: int,
+    library: ScriptLibrary,
+) -> tuple[np.ndarray, str | None]:
+    if not library.known(binding.script_id):
+        return np.array(pixels, copy=True), f"{layer.name}: missing script {binding.script_id}"
+    proc = library.get(binding.script_id)
+    label = proc.label
     try:
-        params = resolve_params(proc, layer.script.params)
+        params = resolve_params(proc, binding.params)
         own = proc.variant_count(params)
         local = ((export_index - 1) % own) + 1
         context = ScriptContext(
@@ -120,22 +155,31 @@ def _process_layer(
             height=doc.height,
             layer_name=layer.name,
         )
-        image = array_to_image(layer.pixels)
-        output = proc.apply(image, layer.script.params, context)
+        image = array_to_image(pixels)
+        output = proc.apply(image, binding.params, context)
         if isinstance(output, list):
             if not output:
                 raise ProcessError("script returned no images")
             output = output[(local - 1) % len(output)]
         return image_to_array(output), None
     except Exception as exc:
-        return layer.pixels.copy(), f"{layer.name}: {exc}"
+        return np.array(pixels, copy=True), f"{layer.name} · {label}: {exc}"
 
 
 def _layer_count(layer: Layer, library: ScriptLibrary) -> int:
-    proc: Processor = library.get(layer.script.script_id)
-    if not library.known(layer.script.script_id):
+    count = 1
+    for binding in layer.scripts:
+        count = max(count, _binding_count(binding, library))
+    return count
+
+
+def _binding_count(binding, library: ScriptLibrary) -> int:
+    if not binding.script_id or binding.script_id == "none":
         return 1
+    if not library.known(binding.script_id):
+        return 1
+    proc: Processor = library.get(binding.script_id)
     try:
-        return proc.variant_count(layer.script.params)
+        return proc.variant_count(binding.params)
     except Exception:
         return 1

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..model import TILE, Color, Document
+from ..model import BLOCK_SHEET, TILE, Color, Document
 
 PRESETS: tuple[tuple[str, int | None, int | None], ...] = (
     ("16 × 16 block", 16, 16),
@@ -34,15 +34,26 @@ PRESETS: tuple[tuple[str, int | None, int | None], ...] = (
 
 
 class NewTextureDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, kind: str = "texture") -> None:
         super().__init__(parent)
-        self.setWindowTitle("New texture")
         self.result_size: tuple[int, int] | None = None
         self.result_name = "texture"
+        self.result_kind = "texture"
         self.result_fill: Color | None = None
         self._fill: Color = (127, 127, 127, 255)
         self._use_fill = False
+        self._name_auto = True
 
+        self.kind = QComboBox()
+        self.kind.addItem("Texture", "texture")
+        self.kind.addItem("Block", "block")
+        self.kind.addItem("Item", "item")
+        self.kind.addItem("Crop", "crop")
+        self.kind.setToolTip(
+            "Chosen for this new file. A block is drawn as six faces. "
+            "A crop is a row of plant stages. Block, item, and crop files export a definition."
+        )
+        self.result_stages = 4
         self.name = QLineEdit("texture")
         self.preset = QComboBox()
         for label, _w, _h in PRESETS:
@@ -51,16 +62,23 @@ class NewTextureDialog(QDialog):
         self.height = _size_box()
         self.fill_button = QPushButton("Transparent")
         self.fill_button.clicked.connect(self._pick_fill)
-        hint = QLabel("Width and height are multiples of 16, matching block and item slots.")
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
+        self.stages = QSpinBox()
+        self.stages.setRange(2, 16)
+        self.stages.setValue(4)
+        self.stages.setToolTip("How many growth sprites. Each one is 16×16.")
+        self.hint = QLabel("")
+        self.hint.setObjectName("hint")
+        self.hint.setWordWrap(True)
 
         form = QFormLayout()
+        form.addRow("Kind", self.kind)
         form.addRow("Name", self.name)
         form.addRow("Preset", self.preset)
         form.addRow("Width", self.width)
         form.addRow("Height", self.height)
         form.addRow("Background", self.fill_button)
+        form.addRow("Stages", self.stages)
+        self._form = form
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._accept)
@@ -68,14 +86,72 @@ class NewTextureDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
-        layout.addWidget(hint)
+        layout.addWidget(self.hint)
         layout.addWidget(buttons)
 
+        self.kind.currentIndexChanged.connect(self._kind_changed)
+        self.name.textEdited.connect(self._lock_name)
         self.preset.currentIndexChanged.connect(self._apply_preset)
+        self.stages.valueChanged.connect(self._stages_changed)
         self.width.valueChanged.connect(self._mark_custom)
         self.height.valueChanged.connect(self._mark_custom)
-        self._apply_preset(0)
-        self.resize(360, 240)
+        index = self.kind.findData(kind)
+        if index >= 0:
+            self.kind.setCurrentIndex(index)
+        self._kind_changed()
+        self.resize(360, 260)
+
+    def _lock_name(self) -> None:
+        self._name_auto = False
+
+    def _kind_changed(self) -> None:
+        kind = str(self.kind.currentData() or "texture")
+        titles = {"texture": "New texture", "block": "New block", "item": "New item", "crop": "New crop"}
+        self.setWindowTitle(titles.get(kind, "New texture"))
+        if self._name_auto:
+            self.name.setText(kind)
+        show_stages = kind == "crop"
+        self.stages.setVisible(show_stages)
+        stages_label = self._form.labelForField(self.stages)
+        if stages_label is not None:
+            stages_label.setVisible(show_stages)
+        locked = kind in ("block", "crop")
+        self.preset.setEnabled(not locked)
+        self.width.setEnabled(not locked)
+        self.height.setEnabled(not locked)
+        if kind == "crop":
+            self.width.blockSignals(True)
+            self.height.blockSignals(True)
+            self.width.setValue(self.stages.value() * TILE)
+            self.height.setValue(TILE)
+            self.width.blockSignals(False)
+            self.height.blockSignals(False)
+            self.hint.setText("A crop is a row of 16×16 plant stages, plus the soil it roots in.")
+            return
+        if locked:
+            self.width.blockSignals(True)
+            self.height.blockSignals(True)
+            self.width.setValue(BLOCK_SHEET[0])
+            self.height.setValue(BLOCK_SHEET[1])
+            self.width.blockSignals(False)
+            self.height.blockSignals(False)
+            self.hint.setText("A block is six 16×16 faces: top, bottom, north, south, east, and west.")
+            return
+        if kind == "item":
+            self.hint.setText("An item is one icon. 16×16 matches a block-game slot.")
+        else:
+            self.hint.setText("Width and height are multiples of 16, matching block and item slots.")
+        self._apply_preset(self.preset.currentIndex())
+
+    def _stages_changed(self, value: int) -> None:
+        if str(self.kind.currentData() or "") != "crop":
+            return
+        self.width.blockSignals(True)
+        self.height.blockSignals(True)
+        self.width.setValue(int(value) * TILE)
+        self.height.setValue(TILE)
+        self.width.blockSignals(False)
+        self.height.blockSignals(False)
 
     def _apply_preset(self, index: int) -> None:
         _label, width, height = PRESETS[index]
@@ -118,6 +194,19 @@ class NewTextureDialog(QDialog):
         )
 
     def _accept(self) -> None:
+        self.result_kind = str(self.kind.currentData() or "texture")
+        self.result_name = self.name.text().strip() or "texture"
+        self.result_fill = self._fill if self._use_fill else None
+        self.result_stages = int(self.stages.value())
+        if self.result_kind == "crop":
+            count = self.result_stages
+            self.result_size = (count * TILE, TILE)
+            self.accept()
+            return
+        if self.result_kind == "block":
+            self.result_size = BLOCK_SHEET
+            self.accept()
+            return
         width = self.width.value()
         height = self.height.value()
         if width % TILE or height % TILE:
@@ -128,8 +217,6 @@ class NewTextureDialog(QDialog):
             )
             return
         self.result_size = (width, height)
-        self.result_name = self.name.text().strip() or "texture"
-        self.result_fill = self._fill if self._use_fill else None
         self.accept()
 
 

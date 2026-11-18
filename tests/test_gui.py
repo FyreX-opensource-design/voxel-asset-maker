@@ -20,8 +20,10 @@ from PySide6.QtGui import QColor, QImage  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from voxel_asset_maker.gui.dialogs import NewTextureDialog  # noqa: E402
 from voxel_asset_maker.gui.images import numpy_to_qimage, qimage_to_numpy  # noqa: E402
 from voxel_asset_maker.gui.window import MainWindow  # noqa: E402
+from voxel_asset_maker.model import BLOCK_SHEET  # noqa: E402
 
 
 class GuiTests(unittest.TestCase):
@@ -112,6 +114,65 @@ class GuiTests(unittest.TestCase):
             self.assertFalse(np.array_equal(first, second))
             self.assertEqual(window.session.variant_index, window.variant_slider.maximum())
             self.assertEqual(window.variant_spin.value(), window.variant_slider.value())
+        finally:
+            window.session.history.mark_clean()
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_script_list_and_asset_preview(self) -> None:
+        window = MainWindow()
+        window.session.history.mark_clean()
+        try:
+            window.resize(1100, 820)
+            window.show()
+            self.app.processEvents()
+            window.session.new_document(16, 16, name="copper_block", fill=(180, 90, 40, 255))
+            window.session.add_script("hsb")
+            window.session.add_script("noise")
+            window.sync_all()
+            self.app.processEvents()
+            self.assertEqual(window.script_list.count(), 2)
+            self.assertGreater(window.session.variant_count(), 1)
+            self.assertIn("Texture", window.asset_caption.text())
+            self.assertEqual(window.asset_kind.text(), "Texture")
+            dialog = NewTextureDialog(kind="block")
+            self.assertEqual(dialog.kind.currentData(), "block")
+            self.assertEqual(dialog.name.text(), "block")
+            self.assertEqual((dialog.width.value(), dialog.height.value()), BLOCK_SHEET)
+            self.assertFalse(dialog.width.isEnabled())
+            crop_dialog = NewTextureDialog(kind="crop")
+            self.assertEqual(crop_dialog.kind.currentData(), "crop")
+            self.assertEqual(crop_dialog.name.text(), "crop")
+            self.assertEqual(crop_dialog.stages.value(), 4)
+            self.assertEqual(crop_dialog.windowTitle(), "New crop")
+            self.assertEqual((crop_dialog.width.value(), crop_dialog.height.value()), (64, 16))
+            self.assertFalse(crop_dialog.width.isEnabled())
+            file_menu = next(action.menu() for action in window.menuBar().actions() if action.menu() and action.text() == "File")
+            self.assertIn("New crop…", [action.text() for action in file_menu.actions()])
+            window.session.new_document(16, 16, name="copper_block", fill=(180, 90, 40, 255), kind="block")
+            window.sync_all()
+            self.app.processEvents()
+            self.assertEqual(window.session.doc.kind, "block")
+            self.assertEqual(window.asset_kind.text(), "Block")
+            self.assertEqual(len(window.canvas.face_boxes), 6)
+            self.assertIn("south", window.asset_caption.text())
+            pixmap = window.asset_preview.pixmap()
+            self.assertIsNotNone(pixmap)
+            assert pixmap is not None
+            self.assertFalse(pixmap.isNull())
+            self.assertGreater(pixmap.width(), 16)
+            window.preview_right.click()
+            self.app.processEvents()
+            self.assertIn("west", window.asset_caption.text())
+            window.session.new_document(16, 16, name="copper_nugget", kind="item")
+            window.sync_all()
+            self.app.processEvents()
+            self.assertIn("Item", window.asset_caption.text())
+            item = window.asset_preview.pixmap()
+            self.assertIsNotNone(item)
+            assert item is not None
+            self.assertFalse(item.isNull())
         finally:
             window.session.history.mark_clean()
             window.close()

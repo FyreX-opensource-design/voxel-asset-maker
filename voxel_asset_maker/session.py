@@ -11,7 +11,26 @@ from typing import Any
 import numpy as np
 
 from .history import History
-from .model import Color, Document, Layer, empty_pixels, validate_size
+from .model import (
+    BLOCK_FACE_ORIGIN,
+    BLOCK_SHEET,
+    TILE,
+    Color,
+    CropTraits,
+    Document,
+    Layer,
+    ScriptBinding,
+    block_sheet_from_image,
+    ctm_at,
+    ctm_origin,
+    empty_pixels,
+    face_at,
+    mask_block_faces,
+    read_face,
+    stage_at,
+    validate_size,
+    write_face,
+)
 from .pixels import (
     Rect,
     blit,
@@ -51,7 +70,10 @@ class Session:
         self.brush_size = 1
         self.filled_shapes = False
         self.variant_index = 1
+        self.script_index = 0
         self.view_mode = "composite"
+        self.surface = "faces"
+        self.stage_index = 0
         self.show_minor_grid = True
         self.show_major_grid = True
         self.path: Path | None = None
@@ -67,7 +89,10 @@ class Session:
         self.doc = doc
         self.path = path
         self.selection = None
+        self.surface = "faces"
+        self.stage_index = 0
         self.variant_index = 1
+        self.script_index = 0
         self._stroke = None
         self.history.reset()
         self.invalidate()
@@ -81,11 +106,180 @@ class Session:
         height: int,
         name: str = "texture",
         fill: Color | None = None,
+        kind: str = "texture",
+        stages: int = 4,
     ) -> None:
-        width, height = validate_size(width, height)
-        pixels = empty_pixels(width, height, fill)
-        doc = Document(width, height, name=name.strip() or "texture", layers=[Layer("base", pixels)])
+        kind = (kind or "texture").strip().lower() or "texture"
+        if kind == "crop":
+            count = int(np.clip(int(stages), 2, 16))
+            width, height = count * TILE, TILE
+            pixels = empty_pixels(width, height, fill)
+            doc = Document(
+                width,
+                height,
+                name=name.strip() or "crop",
+                layers=[Layer("base", pixels)],
+                kind="crop",
+                crop=CropTraits(stages=count),
+            )
+            self.replace_document(doc, None)
+            return
+        if kind == "block":
+            width, height = BLOCK_SHEET
+            pixels = empty_pixels(width, height)
+            if fill is not None:
+                tile = np.zeros((TILE, TILE, 4), dtype=np.uint8)
+                tile[:, :] = fill
+                for face in BLOCK_FACE_ORIGIN:
+                    write_face(pixels, face, tile)
+        else:
+            width, height = validate_size(width, height)
+            pixels = empty_pixels(width, height, fill)
+        doc = Document(
+            width,
+            height,
+            name=name.strip() or "texture",
+            layers=[Layer("base", pixels)],
+            kind=kind,
+        )
+        if kind == "item":
+            doc.traits.tab = "materials"
+            doc.traits.__post_init__()
         self.replace_document(doc, None)
+
+    def set_kind(self, kind: str) -> None:
+        """Switch what this file is. Block lays the canvas out as six faces."""
+        kind = (kind or "texture").strip().lower() or "texture"
+        if kind == self.doc.kind:
+            return
+        self.begin_edit()
+        previous = self.doc.kind
+        if kind == "block":
+            for layer in self.doc.layers:
+                layer.pixels = block_sheet_from_image(layer.pixels)
+                layer.offset = (0, 0)
+            self.doc.width, self.doc.height = BLOCK_SHEET
+        elif previous == "block" and kind == "item":
+            for layer in self.doc.layers:
+                layer.pixels = read_face(layer.pixels, "south")
+                layer.offset = (0, 0)
+            self.doc.width, self.doc.height = TILE, TILE
+        self.doc.kind = kind
+        self.selection = None
+        self._clamp_surface()
+        self.end_edit()
+        self.invalidate()
+
+    def set_surface(self, surface: str) -> None:
+        """Choose faces, the connected-texture sheet, or the glow map."""
+        surface = surface if surface in ("faces", "ctm", "glow") else "faces"
+        if surface == self.surface:
+            self._clamp_surface()
+            return
+        self.surface = surface
+        self.selection = None
+        self._clamp_surface()
+        self.invalidate()
+
+    def set_ctm(self, enabled: bool) -> None:
+        enabled = bool(enabled) and self.doc.kind == "block"
+        if enabled == self.doc.ctm:
+            return
+        self.doc.ctm = enabled
+        if enabled:
+            self.surface = "ctm"
+        self.selection = None
+        self._clamp_surface()
+        self.invalidate()
+
+    def set_fluor_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled) and self.doc.kind == "block"
+        if enabled == self.doc.fluor.enabled:
+            return
+        self.doc.fluor.enabled = enabled
+        if enabled and self.doc.fluor.mode == "texture":
+            self.surface = "glow"
+        self.selection = None
+        self._clamp_surface()
+        self.invalidate()
+
+    def set_fluor_mode(self, mode: str) -> None:
+        mode = mode if mode in ("texture", "color") else "texture"
+        if mode == self.doc.fluor.mode:
+            return
+        self.doc.fluor.mode = mode
+        if mode == "texture" and self.doc.fluor.enabled:
+            self.surface = "glow"
+        self._clamp_surface()
+        self.invalidate()
+
+    def set_fluor_color(self, color: str) -> None:
+        self.doc.fluor.color = color
+        self.doc.fluor.__post_init__()
+
+    def set_fluor_range(self, start: int, full: int) -> None:
+        self.doc.fluor.start = int(start)
+        self.doc.fluor.full = int(full)
+        self.doc.fluor.__post_init__()
+
+    def set_fluor_strength(self, strength: float) -> None:
+        self.doc.fluor.strength = float(strength)
+        self.doc.fluor.__post_init__()
+
+    def set_block_trait(self, **changes: object) -> None:
+        traits = self.doc.traits
+        allowed = (
+            "shape",
+            "tab",
+            "hardness",
+            "tool",
+            "mining_level",
+            "sound",
+            "render",
+            "solid",
+            "gravity",
+            "light",
+            "full_block",
+        )
+        for key, value in changes.items():
+            if key in allowed:
+                setattr(traits, key, value)
+        traits.__post_init__()
+        self.invalidate()
+
+    def set_crop(self, **changes: object) -> None:
+        crop = self.doc.crop
+        allowed = (
+            "stages",
+            "min_time",
+            "max_time",
+            "needs_water",
+            "water_radius",
+            "water_vertical",
+            "seeds",
+            "produce",
+            "food",
+            "ground",
+            "seed_tab",
+            "produce_tab",
+        )
+        for key, value in changes.items():
+            if key in allowed:
+                setattr(crop, key, value)
+        crop.__post_init__()
+        if self.doc.kind == "crop":
+            width = crop.stages * TILE
+            if self.doc.width != width or self.doc.height != TILE:
+                from .model import refit
+
+                for layer in self.doc.layers:
+                    layer.pixels = refit(layer.pixels, width, TILE, "topleft")
+                self.doc.width = width
+                self.doc.height = TILE
+                self.selection = None
+        if self.stage_index >= crop.stages:
+            self.stage_index = crop.stages - 1
+        self.invalidate()
 
     def save(self, path: Path | None = None) -> Path:
         target = Path(path) if path is not None else self.path
@@ -124,6 +318,12 @@ class Session:
     def resize(self, width: int, height: int, anchor: str = "topleft") -> None:
         from .model import refit
 
+        if self.doc.kind == "block":
+            self.message = "Block faces stay 16×16. Switch the kind to Texture to resize the canvas."
+            return
+        if self.doc.kind == "crop":
+            self.message = "A crop grows by its stage count. Change Stages in the Asset panel."
+            return
         width, height = validate_size(width, height)
         self.begin_edit()
         for layer in self.doc.layers:
@@ -159,6 +359,7 @@ class Session:
         if not self.history.undo(self.doc):
             return False
         self.selection = None
+        self._clamp_surface()
         self._clamp_variant()
         self.invalidate()
         return True
@@ -168,6 +369,7 @@ class Session:
             return False
         if not self.history.redo(self.doc):
             return False
+        self._clamp_surface()
         self.selection = None
         self._clamp_variant()
         self.invalidate()
@@ -191,20 +393,29 @@ class Session:
     def display_array(self) -> np.ndarray:
         if self._display_cache is not None:
             return self._display_cache
+        if self._on_extra():
+            self.script_errors = []
+            self._display_cache = self._pixels()
+            return self._display_cache
         if self.view_mode == "layer":
             self.script_errors = []
-            self._display_cache = self.doc.active_layer.pixels
-            return self._display_cache
-        try:
-            result = render_variant(self.doc, self.variant_index, self.library)
-            self.script_errors = list(result.errors)
-            self._display_cache = np.array(result.image, dtype=np.uint8)
-        except Exception as exc:
-            self.script_errors = [str(exc)]
-            self._display_cache = self.doc.active_layer.pixels
+            shown = self._pixels()
+        else:
+            try:
+                result = render_variant(self.doc, self.variant_index, self.library)
+                self.script_errors = list(result.errors)
+                shown = np.array(result.image, dtype=np.uint8)
+            except Exception as exc:
+                self.script_errors = [str(exc)]
+                shown = self._pixels()
+        if self.doc.kind == "block":
+            shown = mask_block_faces(shown)
+        self._display_cache = shown
         return self._display_cache
 
     def selection_offset(self) -> tuple[int, int]:
+        if self._on_extra():
+            return (0, 0)
         if self.view_mode == "composite":
             ox, oy = self.doc.active_layer.offset
             return int(ox), int(oy)
@@ -286,6 +497,7 @@ class Session:
     def set_active(self, index: int) -> None:
         if 0 <= index < len(self.doc.layers) and index != self.doc.active_index:
             self.doc.active_index = index
+            self.script_index = 0
             self.selection = None
             self.invalidate()
 
@@ -311,11 +523,28 @@ class Session:
         self.invalidate()
 
     def set_offset(self, x: int, y: int) -> None:
+        if self.doc.kind in ("block", "crop"):
+            return
         self.doc.active_layer.offset = (int(x), int(y))
         self.invalidate()
 
+    def current_binding(self) -> ScriptBinding | None:
+        scripts = self.doc.active_layer.scripts
+        if not scripts:
+            return None
+        self.script_index = max(0, min(self.script_index, len(scripts) - 1))
+        return scripts[self.script_index]
+
     def set_script_id(self, script_id: str, script_path: str = "") -> None:
-        binding = self.doc.active_layer.script
+        """Set the type of the script currently selected on the active layer."""
+        layer = self.doc.active_layer
+        if not layer.scripts:
+            layer.scripts.append(ScriptBinding())
+            self.script_index = 0
+        binding = self.current_binding()
+        assert binding is not None
+        if binding.script_id != script_id:
+            binding.params = {}
         binding.script_id = script_id
         if script_path:
             binding.script_path = script_path
@@ -326,8 +555,45 @@ class Session:
         self.invalidate()
 
     def set_script_param(self, key: str, value: Any) -> None:
-        self.doc.active_layer.script.params[key] = value
+        binding = self.current_binding()
+        if binding is None:
+            return
+        binding.params[key] = value
         self._clamp_variant()
+        self.invalidate()
+
+    def add_script(self, script_id: str = "none", script_path: str = "") -> None:
+        """Append a script. It runs after the ones already on the layer."""
+        binding = ScriptBinding(script_id, {}, script_path)
+        proc = self.library.get(script_id)
+        for param in proc.params:
+            binding.params.setdefault(param.key, param.default)
+        self.doc.active_layer.scripts.append(binding)
+        self.script_index = len(self.doc.active_layer.scripts) - 1
+        self._clamp_variant()
+        self.invalidate()
+
+    def remove_script(self) -> None:
+        scripts = self.doc.active_layer.scripts
+        if not scripts:
+            return
+        index = max(0, min(self.script_index, len(scripts) - 1))
+        del scripts[index]
+        self.script_index = min(index, max(0, len(scripts) - 1))
+        self._clamp_variant()
+        self.invalidate()
+
+    def move_script(self, delta: int) -> None:
+        """Move the selected script earlier (negative) or later (positive) in the chain."""
+        scripts = self.doc.active_layer.scripts
+        if not scripts:
+            return
+        index = max(0, min(self.script_index, len(scripts) - 1))
+        target = index + int(delta)
+        if not 0 <= target < len(scripts):
+            return
+        scripts[index], scripts[target] = scripts[target], scripts[index]
+        self.script_index = target
         self.invalidate()
 
     def randomize_seed(self) -> None:
@@ -352,19 +618,28 @@ class Session:
             return
         self.begin_edit()
         lx, ly = self.layer_xy(x, y)
-        layer = self.doc.active_layer
+        if self.doc.kind == "crop":
+            index = stage_at(lx, ly, self.doc.crop.stages)
+            if index is not None:
+                self.stage_index = index
+        clip = self._paint_clip(lx, ly)
+        if self._paint_is_blocked(clip):
+            self.history.abandon()
+            return
+        target = self._pixels()
         self._stroke = {
             "tool": self.tool,
             "button": button,
             "anchor": (lx, ly),
             "last": (lx, ly),
-            "before": layer.pixels.copy(),
+            "before": target.copy(),
             "moved": False,
+            "clip": clip,
         }
         if self.tool in ("pencil", "eraser"):
             self._stamp(lx, ly, button)
         elif self.tool == "fill":
-            flood_fill(layer.pixels, lx, ly, self._color(button), self.selection)
+            flood_fill(target, lx, ly, self._color(button), clip)
         elif self.tool == "line":
             self._draw_line((lx, ly), (lx, ly), button)
         elif self.tool == "rect":
@@ -383,10 +658,10 @@ class Session:
             last = self._stroke["last"]
             self._stroke_between(last, (lx, ly), button)
         elif tool == "line":
-            self.doc.active_layer.pixels[:] = self._stroke["before"]
+            self._pixels()[:] = self._stroke["before"]
             self._draw_line(self._stroke["anchor"], (lx, ly), button)
         elif tool == "rect":
-            self.doc.active_layer.pixels[:] = self._stroke["before"]
+            self._pixels()[:] = self._stroke["before"]
             self._draw_rect(self._stroke["anchor"], (lx, ly), button)
         elif tool == "select":
             self._select_move(lx, ly)
@@ -409,12 +684,14 @@ class Session:
     def cancel_stroke(self) -> None:
         if not self._stroke:
             return
-        self.doc.active_layer.pixels[:] = self._stroke["before"]
+        self._pixels()[:] = self._stroke["before"]
         self._stroke = None
         self.history.abandon()
         self.invalidate()
 
     def layer_xy(self, x: int, y: int) -> tuple[int, int]:
+        if self._on_extra():
+            return int(x), int(y)
         if self.view_mode == "composite":
             ox, oy = self.doc.active_layer.offset
             return int(x) - int(ox), int(y) - int(oy)
@@ -428,21 +705,22 @@ class Session:
             return
         sx, sy, sw, sh = self.selection
         self.begin_edit()
-        lifted = extract(self.doc.active_layer.pixels, sx, sy, sw, sh)
-        clear_region(self.doc.active_layer.pixels, sx, sy, sw, sh)
-        blit(self.doc.active_layer.pixels, lifted, sx + dx, sy + dy)
+        lifted = extract(self._pixels(), sx, sy, sw, sh)
+        clear_region(self._pixels(), sx, sy, sw, sh)
+        blit(self._pixels(), lifted, sx + dx, sy + dy)
         self.selection = (sx + dx, sy + dy, sw, sh)
         self.end_edit()
         self.invalidate()
 
     def select_all(self) -> None:
-        self.selection = (0, 0, self.doc.width, self.doc.height)
+        image = self._pixels()
+        self.selection = (0, 0, int(image.shape[1]), int(image.shape[0]))
 
     def deselect(self) -> None:
         self.selection = None
 
     def copy_selection(self) -> np.ndarray:
-        pixels = self.doc.active_layer.pixels
+        pixels = self._pixels()
         if self.selection is None:
             copied = pixels.copy()
         else:
@@ -457,7 +735,7 @@ class Session:
         copied = self.copy_selection()
         self.begin_edit()
         x, y, w, h = self.selection
-        clear_region(self.doc.active_layer.pixels, x, y, w, h)
+        clear_region(self._pixels(), x, y, w, h)
         self.end_edit()
         self.invalidate()
         return copied
@@ -477,7 +755,7 @@ class Session:
             dest_x, dest_y = self.selection[0], self.selection[1]
         else:
             dest_x, dest_y = 0, 0
-        blit(self.doc.active_layer.pixels, pasted, dest_x, dest_y)
+        blit(self._pixels(), pasted, dest_x, dest_y)
         self.selection = (dest_x, dest_y, pasted.shape[1], pasted.shape[0])
         self._clipboard = pasted
         self.end_edit()
@@ -489,7 +767,7 @@ class Session:
             return
         self.begin_edit()
         x, y, w, h = self.selection
-        clear_region(self.doc.active_layer.pixels, x, y, w, h)
+        clear_region(self._pixels(), x, y, w, h)
         self.end_edit()
         self.invalidate()
 
@@ -497,27 +775,27 @@ class Session:
         self.begin_edit()
         if self.selection is not None:
             x, y, w, h = self.selection
-            clear_region(self.doc.active_layer.pixels, x, y, w, h)
+            clear_region(self._pixels(), x, y, w, h)
         else:
-            self.doc.active_layer.pixels[:] = 0
+            self._pixels()[:] = 0
         self.end_edit()
         self.invalidate()
 
     def flip_horizontal(self) -> None:
         self.begin_edit()
-        flip_horizontal(self.doc.active_layer.pixels, self.selection)
+        flip_horizontal(self._pixels(), self.selection)
         self.end_edit()
         self.invalidate()
 
     def flip_vertical(self) -> None:
         self.begin_edit()
-        flip_vertical(self.doc.active_layer.pixels, self.selection)
+        flip_vertical(self._pixels(), self.selection)
         self.end_edit()
         self.invalidate()
 
     def rotate_cw(self) -> None:
         self.begin_edit()
-        updated = rotate_cw(self.doc.active_layer.pixels, self.selection)
+        updated = rotate_cw(self._pixels(), self.selection)
         if self.selection is not None and updated is not None:
             self.selection = updated
         self.end_edit()
@@ -553,26 +831,97 @@ class Session:
             return (0, 0, 0, 0)
         return self.bg if button == 2 else self.fg
 
+    def _on_extra(self) -> bool:
+        if self.doc.kind != "block":
+            return False
+        if self.surface == "ctm" and self.doc.ctm:
+            return True
+        return self.surface == "glow" and self.doc.fluor.enabled and self.doc.fluor.mode == "texture"
+
+    def _pixels(self) -> np.ndarray:
+        if self.doc.kind == "block" and self.surface == "ctm" and self.doc.ctm:
+            return self.doc.ctm_pixels
+        if self.doc.kind == "block" and self.surface == "glow" and self.doc.fluor.enabled and self.doc.fluor.mode == "texture":
+            return self.doc.fluor.pixels
+        return self.doc.active_layer.pixels
+
+    def _clamp_surface(self) -> None:
+        if self.surface == "ctm" and not (self.doc.kind == "block" and self.doc.ctm):
+            self.surface = "faces"
+            self.selection = None
+        elif self.surface == "glow" and not (
+            self.doc.kind == "block" and self.doc.fluor.enabled and self.doc.fluor.mode == "texture"
+        ):
+            self.surface = "faces"
+            self.selection = None
+
+    def _paint_is_blocked(self, clip: Rect | None) -> bool:
+        """Faces and connection tiles ignore a stroke that starts off a cell."""
+        if self.tool == "select" or clip is not None:
+            return False
+        if self.surface == "ctm" and self.doc.kind == "block" and self.doc.ctm:
+            return True
+        if self.doc.kind == "crop":
+            return True
+        return self.doc.kind == "block" and self.surface == "faces"
+
+    def _paint_clip(self, x: int, y: int):
+        """Selection, limited to the block face or connection tile under the pointer."""
+        if self.surface == "ctm" and self.doc.kind == "block" and self.doc.ctm:
+            index = ctm_at(x, y)
+            if index is None:
+                return None
+            origin_x, origin_y = ctm_origin(index)
+            cell = (origin_x, origin_y, TILE, TILE)
+            if self.selection is None:
+                return cell
+            return _intersect(self.selection, cell)
+        if self.surface == "glow":
+            return self.selection
+        if self.doc.kind == "crop":
+            index = stage_at(x, y, self.doc.crop.stages)
+            if index is None:
+                return None
+            cell = (index * TILE, 0, TILE, TILE)
+            if self.selection is None:
+                return cell
+            return _intersect(self.selection, cell)
+        if self.doc.kind != "block":
+            return self.selection
+        name = face_at(x, y)
+        if name is None or (self.doc.traits.shape == "cross" and name != "south"):
+            return None
+        origin_x, origin_y = BLOCK_FACE_ORIGIN[name]
+        face = (origin_x, origin_y, TILE, TILE)
+        if self.selection is None:
+            return face
+        return _intersect(self.selection, face)
+
+    def _clip(self):
+        if self._stroke is not None and "clip" in self._stroke:
+            return self._stroke["clip"]
+        return self.selection
+
     def _stamp(self, x: int, y: int, button: int) -> None:
         stamp_brush(
-            self.doc.active_layer.pixels,
+            self._pixels(),
             x,
             y,
             self._color(button),
             self.brush_size,
-            self.selection,
+            self._clip(),
         )
 
     def _stroke_between(self, start: tuple[int, int], end: tuple[int, int], button: int) -> None:
         stroke_line(
-            self.doc.active_layer.pixels,
+            self._pixels(),
             start[0],
             start[1],
             end[0],
             end[1],
             self._color(button),
             self.brush_size,
-            self.selection,
+            self._clip(),
         )
 
     def _draw_line(self, start: tuple[int, int], end: tuple[int, int], button: int) -> None:
@@ -580,7 +929,7 @@ class Session:
 
     def _draw_rect(self, start: tuple[int, int], end: tuple[int, int], button: int) -> None:
         stroke_rect(
-            self.doc.active_layer.pixels,
+            self._pixels(),
             start[0],
             start[1],
             end[0],
@@ -588,11 +937,11 @@ class Session:
             self._color(button),
             self.brush_size,
             self.filled_shapes,
-            self.selection,
+            self._clip(),
         )
 
     def _select_down(self, x: int, y: int) -> None:
-        pixels = self.doc.active_layer.pixels
+        pixels = self._pixels()
         if self.selection is not None and point_in_rect(x, y, self.selection):
             sx, sy, sw, sh = self.selection
             lifted = extract(pixels, sx, sy, sw, sh)
@@ -613,8 +962,8 @@ class Session:
             ax, ay = self._stroke["anchor"]
             sx, sy = self._stroke["sel_origin"]
             lifted = self._stroke["lifted"]
-            self.doc.active_layer.pixels[:] = self._stroke["base"]
-            blit(self.doc.active_layer.pixels, lifted, sx + (x - ax), sy + (y - ay))
+            self._pixels()[:] = self._stroke["base"]
+            blit(self._pixels(), lifted, sx + (x - ax), sy + (y - ay))
             self.selection = (sx + (x - ax), sy + (y - ay), lifted.shape[1], lifted.shape[0])
         else:
             ax, ay = self._stroke["anchor"]
@@ -636,22 +985,36 @@ class Session:
 
     def _store_script_paths(self) -> None:
         for layer in self.doc.layers:
-            proc = self.library.get(layer.script.script_id)
-            if proc.path is not None:
-                layer.script.script_path = str(proc.path)
+            for binding in layer.scripts:
+                proc = self.library.get(binding.script_id)
+                if proc.path is not None:
+                    binding.script_path = str(proc.path)
 
     def _remember_script_paths(self) -> None:
         for layer in self.doc.layers:
-            script_id = layer.script.script_id
-            if self.library.known(script_id) or not layer.script.script_path:
-                continue
-            path = Path(layer.script.script_path)
-            if path.is_file():
-                try:
-                    proc = self.library.load_file(path)
-                    layer.script.script_id = proc.id
-                except Exception as exc:
-                    self.script_errors.append(f"{layer.name}: {exc}")
+            for binding in layer.scripts:
+                script_id = binding.script_id
+                if self.library.known(script_id) or not binding.script_path:
+                    continue
+                path = Path(binding.script_path)
+                if path.is_file():
+                    try:
+                        proc = self.library.load_file(path)
+                        binding.script_id = proc.id
+                    except Exception as exc:
+                        self.script_errors.append(f"{layer.name}: {exc}")
+
+
+def _intersect(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x0 = max(ax, bx)
+    y0 = max(ay, by)
+    x1 = min(ax + aw, bx + bw)
+    y1 = min(ay + ah, by + bh)
+    if x1 <= x0 or y1 <= y0:
+        return (0, 0, 0, 0)
+    return (x0, y0, x1 - x0, y1 - y0)
 
 
 def _hex(color: Color) -> str:

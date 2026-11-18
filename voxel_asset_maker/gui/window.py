@@ -11,6 +11,7 @@ from PySide6.QtGui import (
     QCloseEvent,
     QKeyEvent,
     QKeySequence,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,8 +42,27 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..model import BLEND_MODES, format_hex_color, parse_hex_color
+from ..blockgame import block_view, export_definition, preview_for, sanitize_id
+from ..model import (
+    BLOCK_FACE_ORIGIN,
+    BLOCK_RENDERS,
+    BLOCK_SHAPES,
+    BLOCK_SOUNDS,
+    BLOCK_TABS,
+    BLOCK_TOOLS,
+    SHAPE_LABELS,
+    TILE,
+    BLEND_MODES,
+    ctm_at,
+    ctm_label,
+    ctm_origin,
+    ctm_short,
+    face_at,
+    format_hex_color,
+    parse_hex_color,
+)
 from ..processors import Param
+from ..render import render_variant
 from ..session import Session
 from .canvas import CanvasWidget
 from .dialogs import NewTextureDialog, ResizeDialog, ask_text
@@ -62,11 +82,13 @@ TOOLS = (
 ABOUT = """\
 Voxel Asset Maker paints block and item textures. Width and height stay multiples of 16 so they fit Minecraft, block-game, and Lunati slots. A 16×48 canvas is a three-frame strip; the amber grid marks every 16 pixels.
 
-Layers stack from bottom to top. A script on a layer runs on that layer's pixels before the stack is flattened. Result view shows the flattened texture for the variant on the slider. Layer pixels view shows the active layer before its script, which is the bitmap you paint.
+Layers stack from bottom to top. Scripts on a layer run top to bottom, and each one sees the image from the script above it, before the stack is flattened. Result view shows the flattened texture for the variant on the slider. Layer pixels view shows the active layer before its scripts, which is the bitmap you paint.
 
-Noise is texture_noise. Adjust color is texture_adjust. Edge shade and Brightness steps ship as extra scripts. Drop another .py file in user_scripts/ next to the app, or in ~/.voxel-asset-maker/scripts/, then choose Reload scripts.
+Noise is texture_noise. Adjust color is texture_adjust. Edge shade and Brightness steps ship as extra scripts. Drop another .py file in user_scripts/ next to the app, or in ~/.voxel-asset-maker/scripts/, then choose Reload scripts. Add puts another script on the same layer.
 
-The variant slider and box under the toolbar scrub those variants in Result view. They stay on 1 until a layer's Count is above 1. Noise starts at 4. Export PNG writes the variant you're viewing. Export Variant ZIP writes one composited PNG per variant, plus manifest.json. The file count is the highest Count on any layer. A Noise layer with Count 8 makes eight textures, each with its own grain, and the other layers composite on top of every one. A script with a shorter count repeats.
+The variant slider and box under the toolbar scrub those variants in Result view. They stay on 1 until a script's Count is above 1. Noise starts at 4. Export PNG writes the variant you're viewing. Export Variant ZIP writes one composited PNG per variant, plus manifest.json. The file count is the highest Count on any script. A Noise script with Count 8 makes eight textures, and a shorter script repeats.
+
+File → New texture, New block, New item, or New crop sets the kind before you draw, and that kind stays with the file. Texture is a free canvas. Block unfolds the cube into six faces — top, bottom, north, south, east, and west — and drawing stays on the face you started the stroke on. Item is one icon. A crop is a row of plant stages, with its grow time, water, seeds, produce, and the soil it roots in. A block can be a cube, slab, vertical slab, stairs, fence, wall, or a plant. A plant is two crossed planes, and you paint that sprite on the south face. The tab and the sound can be any name the game loads. Hardness, tool, mining level, render mode, and the other block fields are part of a block file. A block can also carry connected textures (sixteen tiles, one per neighbor mask) and fluorescence (a glow map or a flat color, with the UV levels where it fades in). Export definition writes a zip with the block or item JSON and its textures. It does not change a block-game checkout. The block preview starts looking from the southeast and turns in quarter steps, including a look at the underside.
 
 Custom script shape:
 
@@ -94,6 +116,8 @@ class MainWindow(QMainWindow):
         self._fitted = False
         self._fit_attempts = 0
         self._hover = (-1, -1)
+        self.preview_yaw = 0
+        self.preview_pitch = 0
         self._history_widgets: set[QWidget] = set()
         self._palette_chips: list[PaletteChip] = []
         self.settings = QSettings("voxel-asset-maker", "VoxelAssetMaker")
@@ -122,7 +146,10 @@ class MainWindow(QMainWindow):
         view_menu = self.menuBar().addMenu("View")
         help_menu = self.menuBar().addMenu("Help")
 
-        self._add_action(file_menu, "New…", self.new_texture, QKeySequence.StandardKey.New)
+        self._add_action(file_menu, "New texture…", lambda: self.new_texture("texture"), QKeySequence.StandardKey.New)
+        self._add_action(file_menu, "New block…", lambda: self.new_texture("block"))
+        self._add_action(file_menu, "New item…", lambda: self.new_texture("item"))
+        self._add_action(file_menu, "New crop…", lambda: self.new_texture("crop"))
         self._add_action(file_menu, "Open project…", self.open_project, QKeySequence.StandardKey.Open)
         self._add_action(file_menu, "Open image…", self.open_image)
         self._add_action(file_menu, "Save", self.save_project, QKeySequence.StandardKey.Save)
@@ -131,6 +158,7 @@ class MainWindow(QMainWindow):
         self._add_action(file_menu, "Import layer…", self.import_layer)
         self._add_action(file_menu, "Export PNG…", self.export_png, "Ctrl+E")
         self._add_action(file_menu, "Export variant ZIP…", self.export_zip, "Ctrl+Shift+E")
+        self._add_action(file_menu, "Export definition…", self.export_asset_definition, "Ctrl+Shift+B")
         file_menu.addSeparator()
         self._add_action(file_menu, "Quit", self.close, QKeySequence.StandardKey.Quit)
 
@@ -191,10 +219,10 @@ class MainWindow(QMainWindow):
         self.view_result = QPushButton("Result")
         self.view_result.setCheckable(True)
         self.view_result.setChecked(True)
-        self.view_result.setToolTip("Flattened texture with each layer's script applied.")
+        self.view_result.setToolTip("Flattened texture with each layer's scripts applied.")
         self.view_layer = QPushButton("Layer pixels")
         self.view_layer.setCheckable(True)
-        self.view_layer.setToolTip("The active layer before its script runs. This is what you paint.")
+        self.view_layer.setToolTip("The active layer before its scripts run. This is what you paint.")
         self.view_group = QButtonGroup(self)
         self.view_group.setExclusive(True)
         self.view_group.addButton(self.view_result)
@@ -240,8 +268,8 @@ class MainWindow(QMainWindow):
         self.variant_slider.setRange(1, 1)
         self.variant_slider.setEnabled(False)
         self.variant_slider.setMinimumWidth(160)
-        self.variant_slider.setToolTip("Scrub variants. A layer script's Count sets how many there are.")
-        self.variant_label = QLabel("of 1 — set Count above 1 on the layer script")
+        self.variant_slider.setToolTip("Scrub variants. A script's Count sets how many there are.")
+        self.variant_label = QLabel("of 1 — set Count above 1 on a script")
         self.variant_label.setObjectName("hint")
         layout.addWidget(title)
         layout.addWidget(self.variant_spin)
@@ -377,8 +405,29 @@ class MainWindow(QMainWindow):
         form.addRow("Offset", offset_row)
         layout.addWidget(stack)
 
-        script = QGroupBox("Layer script")
+        script = QGroupBox("Layer scripts")
         script_layout = QVBoxLayout(script)
+        self.script_list = QListWidget()
+        self.script_list.setMinimumHeight(72)
+        self.script_list.setMaximumHeight(110)
+        self.script_list.setToolTip("Scripts on this layer, from first to last. Each one sees the previous result.")
+        script_layout.addWidget(self.script_list)
+        script_buttons = QHBoxLayout()
+        self.add_script_button = QPushButton("Add")
+        self.remove_script_button = QPushButton("Remove")
+        self.script_up_button = QPushButton("Up")
+        self.script_down_button = QPushButton("Down")
+        self.add_script_button.setToolTip("Add another script after the ones already on this layer.")
+        self.script_up_button.setToolTip("Run the selected script earlier.")
+        self.script_down_button.setToolTip("Run the selected script later.")
+        for button in (
+            self.add_script_button,
+            self.remove_script_button,
+            self.script_up_button,
+            self.script_down_button,
+        ):
+            script_buttons.addWidget(button)
+        script_layout.addLayout(script_buttons)
         script_row = QHBoxLayout()
         self.script_combo = QComboBox()
         self.reload_scripts_button = QPushButton("Reload")
@@ -396,6 +445,7 @@ class MainWindow(QMainWindow):
         self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.script_scroll = QScrollArea()
         self.script_scroll.setWidgetResizable(True)
+        self.script_scroll.setMinimumHeight(120)
         self.script_scroll.setWidget(self.form_host)
         script_layout.addWidget(self.script_scroll, 1)
         self.error_label = QLabel("")
@@ -403,14 +453,227 @@ class MainWindow(QMainWindow):
         self.error_label.setWordWrap(True)
         script_layout.addWidget(self.error_label)
         layout.addWidget(script, 1)
+        layout.addWidget(self._build_block_game())
 
-        panel = QWidget()
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(0, 0, 0, 0)
-        panel_layout.addWidget(inner)
-        panel.setMinimumWidth(280)
-        panel.setMaximumWidth(380)
-        return panel
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(inner)
+        scroll.setMinimumWidth(280)
+        scroll.setMaximumWidth(400)
+        return scroll
+
+    def _build_block_game(self) -> QGroupBox:
+        box = QGroupBox("Asset")
+        layout = QVBoxLayout(box)
+        kind_row = QHBoxLayout()
+        self.asset_kind = QLabel("Texture")
+        self.asset_kind.setToolTip("Set when the file was created, from File → New texture, New block, New item, or New crop.")
+        self.asset_id = QLineEdit()
+        self.asset_id.setPlaceholderText("asset_id")
+        self.asset_id.setToolTip("Id used in the exported definition.")
+        kind_row.addWidget(self.asset_kind)
+        kind_row.addWidget(self.asset_id, 1)
+        layout.addLayout(kind_row)
+        self.asset_preview = QLabel()
+        self.asset_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.asset_preview.setMinimumHeight(128)
+        self.asset_preview.setStyleSheet("background: #141418; border: 1px solid #34343a;")
+        layout.addWidget(self.asset_preview)
+        self.preview_turn = QWidget()
+        turn_row = QHBoxLayout(self.preview_turn)
+        turn_row.setContentsMargins(0, 0, 0, 0)
+        self.preview_left = QPushButton("Left")
+        self.preview_left.setToolTip("Turn the view one face to the left.")
+        self.preview_right = QPushButton("Right")
+        self.preview_right.setToolTip("Turn the view one face to the right.")
+        self.preview_flip = QPushButton("Underside")
+        self.preview_flip.setCheckable(True)
+        self.preview_flip.setToolTip("Look at the bottom face. Each side hangs from the edge that meets the underside.")
+        turn_row.addWidget(self.preview_left)
+        turn_row.addWidget(self.preview_right)
+        turn_row.addWidget(self.preview_flip)
+        layout.addWidget(self.preview_turn)
+        self.asset_caption = QLabel("")
+        self.asset_caption.setObjectName("hint")
+        self.asset_caption.setWordWrap(True)
+        layout.addWidget(self.asset_caption)
+        self.tab_host = QWidget()
+        tab_form = QFormLayout(self.tab_host)
+        tab_form.setContentsMargins(0, 0, 0, 0)
+        self.tab_combo = QComboBox()
+        self.tab_combo.setEditable(True)
+        self.tab_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for key in BLOCK_TABS:
+            self.tab_combo.addItem(key)
+        self.tab_combo.setToolTip("Creative tab. Choose one, or type any tab id.")
+        tab_form.addRow("Tab", self.tab_combo)
+        layout.addWidget(self.tab_host)
+        self.block_extra = QWidget()
+        extra = QVBoxLayout(self.block_extra)
+        extra.setContentsMargins(0, 0, 0, 0)
+        fields = QFormLayout()
+        fields.setContentsMargins(0, 0, 0, 0)
+        self.shape_combo = QComboBox()
+        for key in BLOCK_SHAPES:
+            self.shape_combo.addItem(SHAPE_LABELS[key], key)
+        self.shape_combo.setToolTip(
+            "The block's model. Fences and walls preview the shape you hold. "
+            "A plant is two crossed planes painted on the south face. "
+            "Growth stages and soil are a crop, from File → New crop."
+        )
+        self.hardness_spin = QDoubleSpinBox()
+        self.hardness_spin.setRange(0.0, 100.0)
+        self.hardness_spin.setSingleStep(0.5)
+        self.hardness_spin.setDecimals(2)
+        self.tool_combo = QComboBox()
+        for key in BLOCK_TOOLS:
+            self.tool_combo.addItem(key.capitalize(), key)
+        self.mining_spin = QSpinBox()
+        self.mining_spin.setRange(0, 4)
+        self.mining_spin.setToolTip("0 is wood or by hand, 1 is stone, 2 is iron.")
+        self.sound_combo = QComboBox()
+        self.sound_combo.setEditable(True)
+        self.sound_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for key in BLOCK_SOUNDS:
+            self.sound_combo.addItem(key)
+        self.sound_combo.setToolTip("Sound set name. Choose one, or type any set the game loads.")
+        self.render_combo = QComboBox()
+        for key in BLOCK_RENDERS:
+            self.render_combo.addItem(key.capitalize(), key)
+        self.render_combo.setToolTip("Cutout keeps transparent pixels. Translucent is for glass and water.")
+        self.solid_check = QCheckBox("Solid")
+        self.solid_check.setToolTip("The block stops movement.")
+        self.gravity_check = QCheckBox("Gravity")
+        self.gravity_check.setToolTip("The block falls when nothing is under it.")
+        self.light_spin = QSpinBox()
+        self.light_spin.setRange(0, 15)
+        self.light_spin.setToolTip("Light the block gives off. 0 is none.")
+        self.full_block_edit = QLineEdit()
+        self.full_block_edit.setPlaceholderText("full_block_id")
+        self.full_block_edit.setToolTip("The full block two of these vertical slabs combine into.")
+        flags = QWidget()
+        flag_row = QHBoxLayout(flags)
+        flag_row.setContentsMargins(0, 0, 0, 0)
+        flag_row.addWidget(self.solid_check)
+        flag_row.addWidget(self.gravity_check)
+        fields.addRow("Shape", self.shape_combo)
+        fields.addRow("Hardness", self.hardness_spin)
+        fields.addRow("Tool", self.tool_combo)
+        fields.addRow("Mining", self.mining_spin)
+        fields.addRow("Sound", self.sound_combo)
+        fields.addRow("Render", self.render_combo)
+        fields.addRow("Light", self.light_spin)
+        fields.addRow(flags)
+        fields.addRow("Full block", self.full_block_edit)
+        extra.addLayout(fields)
+        self._block_fields = fields
+        surface_row = QHBoxLayout()
+        self.surface_group = QButtonGroup(self)
+        self.surface_group.setExclusive(True)
+        self.surface_buttons: dict[str, QPushButton] = {}
+        for key, label, tip in (
+            ("faces", "Faces", "Paint the six faces of the block."),
+            ("ctm", "Connections", "Paint the sixteen connected-texture tiles. U up, D down, L left, R right."),
+            ("glow", "Glow", "Paint the fluorescence map."),
+        ):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setToolTip(tip)
+            self.surface_group.addButton(button)
+            self.surface_buttons[key] = button
+            surface_row.addWidget(button)
+        extra.addLayout(surface_row)
+        self.ctm_check = QCheckBox("Connected textures")
+        self.ctm_check.setToolTip(
+            "Export ctm_0 through ctm_15. Each tile is the face when those edges touch the same block."
+        )
+        extra.addWidget(self.ctm_check)
+        self.fluor_check = QCheckBox("Fluorescence")
+        self.fluor_check.setToolTip("The block glows under ultraviolet light.")
+        extra.addWidget(self.fluor_check)
+        self.fluor_options = QWidget()
+        fluor_form = QFormLayout(self.fluor_options)
+        fluor_form.setContentsMargins(0, 0, 0, 0)
+        self.fluor_mode = QComboBox()
+        self.fluor_mode.addItem("Glow map", "texture")
+        self.fluor_mode.addItem("Flat color", "color")
+        self.fluor_color = QPushButton("#9dff57")
+        self.fluor_start = QSpinBox()
+        self.fluor_start.setRange(0, 15)
+        self.fluor_full = QSpinBox()
+        self.fluor_full.setRange(0, 15)
+        self.fluor_strength = QDoubleSpinBox()
+        self.fluor_strength.setRange(0.0, 4.0)
+        self.fluor_strength.setSingleStep(0.25)
+        self.fluor_strength.setDecimals(2)
+        fluor_form.addRow("Glow", self.fluor_mode)
+        fluor_form.addRow("Color", self.fluor_color)
+        fluor_form.addRow("Start", self.fluor_start)
+        fluor_form.addRow("Full", self.fluor_full)
+        fluor_form.addRow("Strength", self.fluor_strength)
+        extra.addWidget(self.fluor_options)
+        layout.addWidget(self.block_extra)
+        self.crop_extra = QWidget()
+        crop_form = QFormLayout(self.crop_extra)
+        crop_form.setContentsMargins(0, 0, 0, 0)
+        self.crop_stages = QSpinBox()
+        self.crop_stages.setRange(2, 16)
+        self.crop_stages.setToolTip("How many growth sprites. Each one is a 16×16 plant.")
+        self.crop_view = QSpinBox()
+        self.crop_view.setRange(1, 16)
+        self.crop_view.setToolTip("Which stage the preview shows. Painting a stage selects it too.")
+        self.crop_min = QDoubleSpinBox()
+        self.crop_min.setRange(1.0, 10000.0)
+        self.crop_min.setDecimals(1)
+        self.crop_min.setSingleStep(10.0)
+        self.crop_max = QDoubleSpinBox()
+        self.crop_max.setRange(1.0, 10000.0)
+        self.crop_max.setDecimals(1)
+        self.crop_max.setSingleStep(10.0)
+        self.crop_water = QCheckBox("Needs water")
+        self.crop_radius = QSpinBox()
+        self.crop_radius.setRange(0, 16)
+        self.crop_vertical = QSpinBox()
+        self.crop_vertical.setRange(0, 8)
+        self.crop_seeds = QLineEdit()
+        self.crop_seeds.setPlaceholderText("crop_seeds")
+        self.crop_produce = QLineEdit()
+        self.crop_produce.setPlaceholderText("same as the crop id")
+        self.crop_food = QSpinBox()
+        self.crop_food.setRange(0, 20)
+        self.crop_ground = QLineEdit()
+        self.crop_ground.setPlaceholderText("farmland")
+        self.crop_ground.setToolTip("Blocks this crop can root in. Separate ids with spaces or commas.")
+        self.crop_seed_tab = QComboBox()
+        self.crop_seed_tab.setEditable(True)
+        self.crop_seed_tab.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.crop_produce_tab = QComboBox()
+        self.crop_produce_tab.setEditable(True)
+        self.crop_produce_tab.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for combo in (self.crop_seed_tab, self.crop_produce_tab):
+            for key in BLOCK_TABS:
+                combo.addItem(key)
+            combo.setToolTip("Creative tab. Choose one, or type any tab id.")
+        crop_form.addRow("Stages", self.crop_stages)
+        crop_form.addRow("Preview", self.crop_view)
+        crop_form.addRow("Min time", self.crop_min)
+        crop_form.addRow("Max time", self.crop_max)
+        crop_form.addRow(self.crop_water)
+        crop_form.addRow("Water radius", self.crop_radius)
+        crop_form.addRow("Water vertical", self.crop_vertical)
+        crop_form.addRow("Seeds", self.crop_seeds)
+        crop_form.addRow("Seed tab", self.crop_seed_tab)
+        crop_form.addRow("Produce", self.crop_produce)
+        crop_form.addRow("Produce tab", self.crop_produce_tab)
+        crop_form.addRow("Food", self.crop_food)
+        crop_form.addRow("Soil", self.crop_ground)
+        layout.addWidget(self.crop_extra)
+        self.export_definition_button = QPushButton("Export definition…")
+        self.export_definition_button.clicked.connect(self.export_asset_definition)
+        layout.addWidget(self.export_definition_button)
+        self._asset_id_auto = ""
+        return box
 
     def _build_statusbar(self) -> None:
         status = QStatusBar()
@@ -444,9 +707,93 @@ class MainWindow(QMainWindow):
         self.blend_combo.currentTextChanged.connect(self._blend_changed)
         self.offset_x.valueChanged.connect(self._offset_changed)
         self.offset_y.valueChanged.connect(self._offset_changed)
+        self.script_list.currentRowChanged.connect(self._script_row_changed)
+        self.add_script_button.clicked.connect(self._add_script)
+        self.remove_script_button.clicked.connect(self._remove_script)
+        self.script_up_button.clicked.connect(lambda: self._move_script(-1))
+        self.script_down_button.clicked.connect(lambda: self._move_script(1))
         self.script_combo.currentIndexChanged.connect(self._script_changed)
         self.reload_scripts_button.clicked.connect(self._reload_scripts)
-        for widget in (self.opacity_slider, self.blend_combo, self.offset_x, self.offset_y):
+        self.preview_left.clicked.connect(lambda: self._turn_preview(-1))
+        self.preview_right.clicked.connect(lambda: self._turn_preview(1))
+        self.preview_flip.toggled.connect(self._flip_preview)
+        self.asset_id.textEdited.connect(self._asset_id_edited)
+        for key, button in self.surface_buttons.items():
+            button.clicked.connect(lambda _checked=False, name=key: self._surface_clicked(name))
+        self.ctm_check.toggled.connect(self._ctm_toggled)
+        self.fluor_check.toggled.connect(self._fluor_toggled)
+        self.fluor_mode.currentIndexChanged.connect(self._fluor_mode_changed)
+        self.fluor_color.clicked.connect(self._pick_fluor_color)
+        self.fluor_start.valueChanged.connect(self._fluor_range_changed)
+        self.fluor_full.valueChanged.connect(self._fluor_range_changed)
+        self.fluor_strength.valueChanged.connect(self._fluor_strength_changed)
+        self.shape_combo.currentIndexChanged.connect(self._shape_changed)
+        self.tool_combo.currentIndexChanged.connect(self._block_trait_changed)
+        self.sound_combo.currentTextChanged.connect(self._block_trait_changed)
+        self.sound_combo.lineEdit().editingFinished.connect(self._sound_finished)
+        self.tab_combo.currentTextChanged.connect(self._tab_edited)
+        self.tab_combo.lineEdit().editingFinished.connect(self._tab_finished)
+        self.crop_stages.valueChanged.connect(self._crop_stages_changed)
+        self.crop_view.valueChanged.connect(self._crop_view_changed)
+        self.crop_min.valueChanged.connect(self._crop_changed)
+        self.crop_max.valueChanged.connect(self._crop_changed)
+        self.crop_water.toggled.connect(self._crop_changed)
+        self.crop_radius.valueChanged.connect(self._crop_changed)
+        self.crop_vertical.valueChanged.connect(self._crop_changed)
+        self.crop_food.valueChanged.connect(self._crop_changed)
+        self.crop_seeds.textEdited.connect(self._crop_changed)
+        self.crop_produce.textEdited.connect(self._crop_changed)
+        self.crop_ground.textEdited.connect(self._crop_changed)
+        self.crop_seed_tab.currentTextChanged.connect(self._crop_changed)
+        self.crop_produce_tab.currentTextChanged.connect(self._crop_changed)
+        for edit in (self.crop_seeds, self.crop_produce, self.crop_ground):
+            edit.editingFinished.connect(self._crop_finished)
+        self.crop_seed_tab.lineEdit().editingFinished.connect(self._crop_finished)
+        self.crop_produce_tab.lineEdit().editingFinished.connect(self._crop_finished)
+        self.render_combo.currentIndexChanged.connect(self._block_trait_changed)
+        self.hardness_spin.valueChanged.connect(self._block_trait_changed)
+        self.mining_spin.valueChanged.connect(self._block_trait_changed)
+        self.light_spin.valueChanged.connect(self._block_trait_changed)
+        self.solid_check.toggled.connect(self._block_trait_changed)
+        self.gravity_check.toggled.connect(self._block_trait_changed)
+        self.full_block_edit.textEdited.connect(self._full_block_edited)
+        self.full_block_edit.editingFinished.connect(self._full_block_finished)
+        for widget in (
+            self.opacity_slider,
+            self.blend_combo,
+            self.offset_x,
+            self.offset_y,
+            self.ctm_check,
+            self.fluor_check,
+            self.fluor_mode,
+            self.fluor_start,
+            self.fluor_full,
+            self.fluor_strength,
+            self.shape_combo,
+            self.tool_combo,
+            self.sound_combo,
+            self.render_combo,
+            self.hardness_spin,
+            self.mining_spin,
+            self.light_spin,
+            self.solid_check,
+            self.gravity_check,
+            self.full_block_edit,
+            self.tab_combo,
+            self.crop_stages,
+            self.crop_min,
+            self.crop_max,
+            self.crop_water,
+            self.crop_radius,
+            self.crop_vertical,
+            self.crop_seeds,
+            self.crop_produce,
+            self.crop_food,
+            self.crop_ground,
+            self.crop_seed_tab,
+            self.crop_produce_tab,
+            *self.surface_buttons.values(),
+        ):
             self._watch_history(widget)
         self.setAcceptDrops(True)
 
@@ -467,6 +814,10 @@ class MainWindow(QMainWindow):
         self.filled_shapes.blockSignals(True)
         self.filled_shapes.setChecked(self.session.filled_shapes)
         self.filled_shapes.blockSignals(False)
+        self._sync_kind()
+        self._sync_block_extra()
+        self._sync_crop()
+        self._sync_asset_id()
         self.refresh_canvas()
         self.sync_title()
 
@@ -517,11 +868,30 @@ class MainWindow(QMainWindow):
         blend_index = self.blend_combo.findText(layer.blend)
         if blend_index >= 0:
             self.blend_combo.setCurrentIndex(blend_index)
-        self.offset_x.setValue(int(layer.offset[0]))
-        self.offset_y.setValue(int(layer.offset[1]))
-        self._select_script(layer.script.script_id)
+        blocked = self.session.doc.kind in ("block", "crop")
+        self.offset_x.setEnabled(not blocked)
+        self.offset_y.setEnabled(not blocked)
+        self.offset_x.setValue(0 if blocked else int(layer.offset[0]))
+        self.offset_y.setValue(0 if blocked else int(layer.offset[1]))
         self._loading = False
+        self.rebuild_script_list()
         self.rebuild_script_form()
+
+    def rebuild_script_list(self) -> None:
+        self._loading = True
+        self.script_list.clear()
+        layer = self.session.doc.active_layer
+        for index, binding in enumerate(layer.scripts):
+            if self.session.library.known(binding.script_id):
+                label = self.session.library.get(binding.script_id).label
+            else:
+                label = binding.script_id
+            self.script_list.addItem(QListWidgetItem(f"{index + 1}. {label}"))
+        if layer.scripts:
+            row = max(0, min(self.session.script_index, len(layer.scripts) - 1))
+            self.session.script_index = row
+            self.script_list.setCurrentRow(row)
+        self._loading = False
 
     def rebuild_script_form(self) -> None:
         self._loading = True
@@ -530,16 +900,23 @@ class MainWindow(QMainWindow):
             self._history_widgets.add(widget)
         while self.form.rowCount():
             self.form.removeRow(0)
-        layer = self.session.doc.active_layer
-        proc = self.session.library.get(layer.script.script_id)
-        if layer.script.script_id != "none" and not self.session.library.known(layer.script.script_id):
-            missing = QLabel(f"Missing script {layer.script.script_id}.")
+        binding = self.session.current_binding()
+        script_id = binding.script_id if binding is not None else "none"
+        proc = self.session.library.get(script_id)
+        if binding is None:
+            self.script_blurb.setText("Add a script to run it on this layer. Scripts run top to bottom.")
+            self._select_script("none")
+            self._loading = False
+            return
+        if script_id != "none" and not self.session.library.known(script_id):
+            missing = QLabel(f"Missing script {script_id}.")
             missing.setObjectName("error")
             missing.setWordWrap(True)
             self.form.addRow(missing)
         self.script_blurb.setText(proc.blurb)
+        self._select_script(script_id)
         params = {param.key: param.default for param in proc.params}
-        params.update({key: value for key, value in layer.script.params.items() if key in params})
+        params.update({key: value for key, value in binding.params.items() if key in params})
         for param in proc.params:
             widget = self._param_widget(param, params.get(param.key))
             label = QLabel(param.label)
@@ -558,8 +935,27 @@ class MainWindow(QMainWindow):
         self.canvas.set_selection(self.session.selection, self.session.selection_offset())
         self.canvas.show_minor_grid = self.session.show_minor_grid
         self.canvas.show_major_grid = self.session.show_major_grid
+        if self.session.doc.kind == "block" and self.session.surface == "ctm":
+            self.canvas.face_boxes = tuple(
+                (ctm_short(index), *ctm_origin(index), TILE, TILE) for index in range(16)
+            )
+        elif self.session.doc.kind == "crop" and self.session.surface != "glow":
+            self.canvas.face_boxes = tuple(
+                (str(index + 1), index * TILE, 0, TILE, TILE) for index in range(self.session.doc.crop.stages)
+            )
+        elif self.session.doc.kind == "block" and self.session.surface != "glow":
+            if self.session.doc.traits.shape == "cross":
+                origin_x, origin_y = BLOCK_FACE_ORIGIN["south"]
+                self.canvas.face_boxes = (("plant", origin_x, origin_y, TILE, TILE),)
+            else:
+                self.canvas.face_boxes = tuple(
+                    (name, origin_x, origin_y, TILE, TILE) for name, (origin_x, origin_y) in BLOCK_FACE_ORIGIN.items()
+                )
+        else:
+            self.canvas.face_boxes = ()
         self.update_variant_controls()
         self.update_errors()
+        self.refresh_preview()
         self.update_status()
 
     def update_variant_controls(self) -> None:
@@ -573,7 +969,7 @@ class MainWindow(QMainWindow):
             widget.blockSignals(False)
         sources = self.session.variant_labels()
         if count <= 1:
-            text = "of 1 — set Count above 1 on the layer script"
+            text = "of 1 — set Count above 1 on a script"
         else:
             text = f"of {count}"
             if sources:
@@ -599,8 +995,30 @@ class MainWindow(QMainWindow):
                 sampled = "  " + format_hex_color(tuple(int(channel) for channel in image[y, x]))
             else:
                 sampled = ""
+        face = ""
+        if doc.kind == "block" and self.session.surface == "ctm" and x >= 0:
+            index = ctm_at(x, y)
+            face = f"    {ctm_label(index)}" if index is not None else "    outside tiles"
+        elif doc.kind == "block" and self.session.surface == "glow" and x >= 0:
+            face = "    glow"
+        elif doc.kind == "crop" and x >= 0:
+            index = x // TILE
+            face = f"    stage {index + 1}" if 0 <= index < doc.crop.stages and 0 <= y < TILE else "    outside stages"
+        elif doc.kind == "block" and x >= 0:
+            name = face_at(x, y)
+            if name == "south" and self.session.doc.traits.shape == "cross":
+                name = "plant"
+            elif name and self.session.doc.traits.shape == "cross":
+                name = None
+            face = f"    {name}" if name else "    outside faces"
+        if self.session.surface == "ctm":
+            size = "64×64"
+        elif self.session.surface == "glow":
+            size = "16×16"
+        else:
+            size = f"{doc.width}×{doc.height}"
         self.status_left.setText(
-            f"{doc.width}×{doc.height}    {self.canvas.zoom}×    {position}{sampled}    {self.session.tool}"
+            f"{size}    {self.canvas.zoom}×    {position}{sampled}    {self.session.tool}{face}"
         )
         self.status_right.setText(self.session.message)
 
@@ -763,12 +1181,12 @@ class MainWindow(QMainWindow):
 
     def _merge_down(self) -> None:
         layer = self.session.doc.active_layer
-        if layer.script.script_id != "none":
+        if any(binding.script_id not in ("", "none") for binding in layer.scripts):
             answer = QMessageBox.question(
                 self,
                 "Merge layer",
                 "Merge blends the painted pixels onto the layer below. "
-                "The script on this layer is dropped and stays unbaked.",
+                "The scripts on this layer are dropped and stay unbaked.",
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
@@ -822,8 +1240,12 @@ class MainWindow(QMainWindow):
 
     # --- scripts ------------------------------------------------------------
 
+    def _current_script_id(self) -> str:
+        binding = self.session.current_binding()
+        return binding.script_id if binding is not None else "none"
+
     def _fill_script_combo(self) -> None:
-        current = self.session.doc.active_layer.script.script_id
+        current = self._current_script_id()
         self.script_combo.blockSignals(True)
         self.script_combo.clear()
         separated = False
@@ -858,14 +1280,45 @@ class MainWindow(QMainWindow):
         self.session.begin_edit()
         self.session.set_script_id(str(script_id))
         self.session.end_edit()
+        self.rebuild_script_list()
         self.rebuild_script_form()
+        self.refresh_canvas()
+        self.sync_title()
+
+    def _script_row_changed(self, row: int) -> None:
+        if self._loading or row < 0:
+            return
+        self.session.script_index = row
+        self.rebuild_script_form()
+
+    def _add_script(self) -> None:
+        self.session.begin_edit()
+        self.session.add_script("none")
+        self.session.end_edit()
+        self.sync_layer_controls()
+        self.refresh_canvas()
+        self.sync_title()
+
+    def _remove_script(self) -> None:
+        self.session.begin_edit()
+        self.session.remove_script()
+        self.session.end_edit()
+        self.sync_layer_controls()
+        self.refresh_canvas()
+        self.sync_title()
+
+    def _move_script(self, delta: int) -> None:
+        self.session.begin_edit()
+        self.session.move_script(delta)
+        self.session.end_edit()
+        self.sync_layer_controls()
         self.refresh_canvas()
         self.sync_title()
 
     def _load_script_file(self) -> None:
         start = self._last_dir()
         path, _selected = QFileDialog.getOpenFileName(self, "Load layer script", start, "Python (*.py)")
-        current = self.session.doc.active_layer.script.script_id
+        current = self._current_script_id()
         if not path:
             self._select_script(current)
             return
@@ -994,14 +1447,22 @@ class MainWindow(QMainWindow):
 
     # --- file ---------------------------------------------------------------
 
-    def new_texture(self) -> None:
+    def new_texture(self, kind: str = "texture") -> None:
         if not self._confirm_discard():
             return
-        dialog = NewTextureDialog(self)
+        dialog = NewTextureDialog(self, kind=kind)
         if dialog.exec() != NewTextureDialog.DialogCode.Accepted or dialog.result_size is None:
             return
         width, height = dialog.result_size
-        self.session.new_document(width, height, dialog.result_name, dialog.result_fill)
+        self._reset_preview_angle()
+        self.session.new_document(
+            width,
+            height,
+            dialog.result_name,
+            dialog.result_fill,
+            dialog.result_kind,
+            stages=dialog.result_stages,
+        )
         self.sync_all()
         self.canvas.fit()
 
@@ -1107,6 +1568,14 @@ class MainWindow(QMainWindow):
         self._report_export(errors)
 
     def resize_canvas(self) -> None:
+        if self.session.doc.kind == "block":
+            self.session.message = "Block faces stay 16×16. Switch the kind to Texture to resize the canvas."
+            self.update_status()
+            return
+        if self.session.doc.kind == "crop":
+            self.session.message = "A crop grows by its stage count. Change Stages in the Asset panel."
+            self.update_status()
+            return
         dialog = ResizeDialog(self.session.doc, self)
         if dialog.exec() != ResizeDialog.DialogCode.Accepted or dialog.result_size is None:
             return
@@ -1120,6 +1589,8 @@ class MainWindow(QMainWindow):
         if not name:
             return
         self.session.set_name(name)
+        self._sync_asset_id()
+        self.refresh_preview()
         self.sync_title()
 
     def show_about(self) -> None:
@@ -1365,8 +1836,413 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open failed", str(exc))
             return
         self._remember_dir(str(path))
+        self._reset_preview_angle()
         self.sync_all()
         self.canvas.fit()
+
+    def _sync_asset_id(self) -> None:
+        auto = sanitize_id(self.session.doc.name)
+        current = self.asset_id.text().strip()
+        if current == "" or current == self._asset_id_auto:
+            self.asset_id.blockSignals(True)
+            self.asset_id.setText(auto)
+            self.asset_id.blockSignals(False)
+        self._asset_id_auto = auto
+
+    def _asset_id_edited(self, _text: str) -> None:
+        self._asset_id_auto = ""
+
+    def _sync_kind(self) -> None:
+        kind = self.session.doc.kind
+        self.asset_kind.setText(kind.replace("_", " ").capitalize())
+        self.preview_turn.setVisible(kind in ("block", "crop"))
+        self.tab_host.setVisible(kind in ("block", "item"))
+        self.block_extra.setVisible(kind == "block")
+        self.crop_extra.setVisible(kind == "crop")
+        self.export_definition_button.setEnabled(kind in ("block", "item", "crop"))
+        if kind in ("block", "item"):
+            self._loading = True
+            self.tab_combo.setEditText(self.session.doc.traits.tab)
+            self._loading = False
+
+    def _sync_block_extra(self) -> None:
+        doc = self.session.doc
+        block = doc.kind == "block"
+        self.block_extra.setVisible(block)
+        if not block:
+            return
+        fluor = doc.fluor
+        self._loading = True
+        self.ctm_check.setChecked(doc.ctm)
+        self.fluor_check.setChecked(fluor.enabled)
+        mode_index = self.fluor_mode.findData(fluor.mode)
+        if mode_index >= 0:
+            self.fluor_mode.setCurrentIndex(mode_index)
+        self.fluor_start.setValue(int(fluor.start))
+        self.fluor_full.setValue(int(fluor.full))
+        self.fluor_strength.setValue(float(fluor.strength))
+        self.fluor_color.setText(fluor.color)
+        self.fluor_color.setStyleSheet(f"background: {fluor.color}; color: #111;")
+        self.fluor_options.setVisible(fluor.enabled)
+        show_color = fluor.enabled and fluor.mode == "color"
+        self.fluor_color.setVisible(show_color)
+        color_label = self.fluor_options.layout().labelForField(self.fluor_color)
+        if color_label is not None:
+            color_label.setVisible(show_color)
+        surface = self.session.surface if self.session.surface in self.surface_buttons else "faces"
+        self.surface_buttons[surface].setChecked(True)
+        traits = doc.traits
+        self._select_data(self.shape_combo, traits.shape)
+        self._select_data(self.tool_combo, traits.tool)
+        self.sound_combo.setEditText(traits.sound)
+        self._select_data(self.render_combo, traits.render)
+        self.hardness_spin.setValue(float(traits.hardness))
+        self.mining_spin.setValue(int(traits.mining_level))
+        self.light_spin.setValue(int(traits.light))
+        self.solid_check.setChecked(bool(traits.solid))
+        self.gravity_check.setChecked(bool(traits.gravity))
+        self.full_block_edit.setText(traits.full_block)
+        show_full = traits.shape == "vertical_slab"
+        self.full_block_edit.setVisible(show_full)
+        full_label = self._block_fields.labelForField(self.full_block_edit)
+        if full_label is not None:
+            full_label.setVisible(show_full)
+        self._loading = False
+
+    def _select_data(self, combo: QComboBox, value: str) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _surface_clicked(self, surface: str) -> None:
+        if self._loading:
+            return
+        doc = self.session.doc
+        if surface == "ctm" and not doc.ctm:
+            self.session.set_ctm(True)
+        elif surface == "glow" and not doc.fluor.enabled:
+            doc.fluor.mode = "texture"
+            self.session.set_fluor_enabled(True)
+        elif surface == "glow" and doc.fluor.mode != "texture":
+            self.session.set_fluor_mode("texture")
+        else:
+            self.session.set_surface(surface)
+        self.sync_all()
+        self.canvas.fit()
+
+    def _ctm_toggled(self, checked: bool) -> None:
+        if self._loading:
+            return
+        self.session.set_ctm(checked)
+        self.sync_all()
+        self.canvas.fit()
+
+    def _fluor_toggled(self, checked: bool) -> None:
+        if self._loading:
+            return
+        self.session.set_fluor_enabled(checked)
+        self.sync_all()
+        self.canvas.fit()
+
+    def _fluor_mode_changed(self, _index: int) -> None:
+        if self._loading:
+            return
+        self.session.set_fluor_mode(str(self.fluor_mode.currentData() or "texture"))
+        self.sync_all()
+        self.canvas.fit()
+
+    def _fluor_range_changed(self, _value: int) -> None:
+        if self._loading:
+            return
+        self.session.set_fluor_range(self.fluor_start.value(), self.fluor_full.value())
+        self._sync_block_extra()
+
+    def _fluor_strength_changed(self, value: float) -> None:
+        if self._loading:
+            return
+        self.session.set_fluor_strength(value)
+
+    def _shape_changed(self, _index: int) -> None:
+        if self._loading:
+            return
+        shape = str(self.shape_combo.currentData() or "cube")
+        changes: dict[str, object] = {"shape": shape}
+        if shape == "cross":
+            changes.update(render="cutout", solid=False, tool="none", hardness=0.0, tab="natural")
+        self.session.set_block_trait(**changes)
+        self._sync_block_extra()
+        self.refresh_canvas()
+
+    def _block_trait_changed(self, _value: object = None) -> None:
+        if self._loading:
+            return
+        self.session.set_block_trait(
+            hardness=float(self.hardness_spin.value()),
+            tool=str(self.tool_combo.currentData() or "pickaxe"),
+            mining_level=int(self.mining_spin.value()),
+            sound=self.sound_combo.currentText(),
+            render=str(self.render_combo.currentData() or "solid"),
+            solid=self.solid_check.isChecked(),
+            gravity=self.gravity_check.isChecked(),
+            light=int(self.light_spin.value()),
+        )
+        self.refresh_preview()
+
+    def _tab_edited(self, text: str) -> None:
+        if self._loading:
+            return
+        self.session.set_block_trait(tab=text)
+
+    def _tab_finished(self) -> None:
+        if self._loading:
+            return
+        self.session.set_block_trait(tab=self.tab_combo.currentText())
+        self._loading = True
+        self.tab_combo.setEditText(self.session.doc.traits.tab)
+        self._loading = False
+
+    def _sync_crop(self) -> None:
+        crop = self.session.doc.crop
+        show = self.session.doc.kind == "crop"
+        self.crop_extra.setVisible(show)
+        if not show:
+            return
+        self._loading = True
+        self.crop_stages.setValue(int(crop.stages))
+        self.crop_view.setRange(1, int(crop.stages))
+        self.crop_view.setValue(self.session.stage_index + 1)
+        self.crop_min.setValue(float(crop.min_time))
+        self.crop_max.setValue(float(crop.max_time))
+        self.crop_water.setChecked(bool(crop.needs_water))
+        self.crop_radius.setValue(int(crop.water_radius))
+        self.crop_vertical.setValue(int(crop.water_vertical))
+        self.crop_seeds.setText(crop.seeds)
+        self.crop_produce.setText(crop.produce)
+        self.crop_food.setValue(int(crop.food))
+        self.crop_ground.setText(crop.ground)
+        self.crop_seed_tab.setEditText(crop.seed_tab)
+        self.crop_produce_tab.setEditText(crop.produce_tab)
+        self._loading = False
+
+    def _crop_stages_changed(self, value: int) -> None:
+        if self._loading:
+            return
+        self.session.set_crop(stages=int(value))
+        self._sync_crop()
+        self.refresh_canvas()
+        self.canvas.fit()
+
+    def _crop_view_changed(self, value: int) -> None:
+        if self._loading:
+            return
+        self.session.stage_index = max(0, int(value) - 1)
+        self.refresh_preview()
+
+    def _crop_changed(self, _value: object = None) -> None:
+        if self._loading:
+            return
+        self.session.set_crop(
+            min_time=float(self.crop_min.value()),
+            max_time=float(self.crop_max.value()),
+            needs_water=self.crop_water.isChecked(),
+            water_radius=int(self.crop_radius.value()),
+            water_vertical=int(self.crop_vertical.value()),
+            seeds=self.crop_seeds.text(),
+            produce=self.crop_produce.text(),
+            food=int(self.crop_food.value()),
+            ground=self.crop_ground.text(),
+            seed_tab=self.crop_seed_tab.currentText(),
+            produce_tab=self.crop_produce_tab.currentText(),
+        )
+        self.refresh_preview()
+
+    def _crop_finished(self) -> None:
+        if self._loading:
+            return
+        self._crop_changed()
+        self._sync_crop()
+
+    def _sound_finished(self) -> None:
+        if self._loading:
+            return
+        self.session.set_block_trait(sound=self.sound_combo.currentText())
+        self._loading = True
+        self.sound_combo.setEditText(self.session.doc.traits.sound)
+        self._loading = False
+
+    def _full_block_edited(self, text: str) -> None:
+        if self._loading:
+            return
+        self.session.set_block_trait(full_block=text)
+
+    def _full_block_finished(self) -> None:
+        if self._loading:
+            return
+        self.session.set_block_trait(full_block=self.full_block_edit.text())
+        self._loading = True
+        self.full_block_edit.setText(self.session.doc.traits.full_block)
+        self._loading = False
+
+    def _pick_fluor_color(self) -> None:
+        current = parse_hex_color(self.session.doc.fluor.color)
+        chosen = QColorDialog.getColor(QColor(*current), self, "Fluorescence")
+        if not chosen.isValid():
+            return
+        self.session.begin_edit()
+        self.session.set_fluor_color(f"#{chosen.red():02x}{chosen.green():02x}{chosen.blue():02x}")
+        self.session.end_edit()
+        self._sync_block_extra()
+        self.sync_title()
+
+    def _turn_preview(self, step: int) -> None:
+        self.preview_yaw = (self.preview_yaw + step) % 4
+        self.refresh_preview()
+
+    def _flip_preview(self, checked: bool) -> None:
+        self.preview_pitch = 1 if checked else 0
+        self.refresh_preview()
+
+    def _reset_preview_angle(self) -> None:
+        self.preview_yaw = 0
+        self.preview_pitch = 0
+        self.preview_flip.blockSignals(True)
+        self.preview_flip.setChecked(False)
+        self.preview_flip.blockSignals(False)
+
+    def refresh_preview(self) -> None:
+        kind = self.session.doc.kind
+        if kind not in ("block", "item", "crop"):
+            self.asset_preview.clear()
+            self.asset_preview.setText("Texture")
+            self.asset_caption.setText(
+                "Texture. Start a block, an item, or a crop from the File menu to draw that asset and export its definition."
+            )
+            return
+        try:
+            if kind == "crop":
+                rendered = render_variant(self.session.doc, self.session.variant_index, self.session.library)
+                preview = preview_for(
+                    rendered.image,
+                    kind,
+                    yaw=self.preview_yaw,
+                    pitch=self.preview_pitch,
+                    stage=self.session.stage_index,
+                )
+            elif kind == "block":
+                rendered = render_variant(self.session.doc, self.session.variant_index, self.session.library)
+                fluor = self.session.doc.fluor
+                glowing = fluor.enabled and fluor.strength > 0
+                preview = preview_for(
+                    rendered.image,
+                    kind,
+                    yaw=self.preview_yaw,
+                    pitch=self.preview_pitch,
+                    ctm=self.session.doc.ctm_pixels if self.session.doc.ctm else None,
+                    glow=fluor.pixels if glowing and fluor.mode == "texture" else None,
+                    glow_color=fluor.color if glowing and fluor.mode == "color" else None,
+                    glow_strength=fluor.strength if glowing else 0.0,
+                    shape=self.session.doc.traits.shape,
+                )
+            elif self.session.view_mode == "composite":
+                image = self.session.display_array()
+                preview = preview_for(image, kind, yaw=self.preview_yaw, pitch=self.preview_pitch)
+            else:
+                image = render_variant(
+                    self.session.doc, self.session.variant_index, self.session.library
+                ).image
+                preview = preview_for(image, kind, yaw=self.preview_yaw, pitch=self.preview_pitch)
+        except Exception as exc:
+            self.asset_preview.setText(str(exc))
+            self.asset_caption.setText("")
+            return
+        pixmap = QPixmap.fromImage(numpy_to_qimage(preview))
+        limit = max(96, self.asset_preview.width() - 12)
+        if pixmap.width() > limit:
+            pixmap = pixmap.scaledToWidth(limit, Qt.TransformationMode.FastTransformation)
+        self.asset_preview.setPixmap(pixmap)
+        asset_id = sanitize_id(self.asset_id.text())
+        count = self.session.variant_count()
+        if kind == "crop":
+            crop = self.session.doc.crop
+            stage = self.session.stage_index + 1
+            if self.crop_view.value() != stage:
+                self._loading = True
+                self.crop_view.setValue(stage)
+                self._loading = False
+            soil = crop.ground.replace(" ", ", ")
+            seeds = crop.seeds or f"{asset_id}_seeds"
+            produce = crop.produce or asset_id
+            caption = (
+                f"Crop {asset_id}. Stage {stage} of {crop.stages}, drawn as a plant. "
+                f"Roots in {soil}. Seeds {seeds} on the {crop.seed_tab} tab, "
+                f"produce {produce} on the {crop.produce_tab} tab."
+            )
+        elif kind == "block":
+            cap, left, right = block_view(self.preview_yaw, self.preview_pitch)
+            palettes = f" Export includes {count} palettes." if count > 1 else ""
+            where = "the underside" if cap == "bottom" else "the top"
+            shape = self.session.doc.traits.shape
+            label = SHAPE_LABELS.get(shape, "Cube").lower()
+            extras = ""
+            if shape == "fence":
+                extras += " The preview is the fence you hold, with posts and rails."
+            elif shape == "wall":
+                extras += " The preview is the wall you hold, with a post and a run."
+            elif shape == "cross":
+                extras += " The south face is the plant, drawn as two crossed planes."
+            if self.session.doc.ctm and shape == "cube":
+                extras += " Four blocks share edges, so each face shows the connected tile."
+            elif self.session.doc.ctm:
+                extras += " Connected textures are in the export. The preview shows the shape."
+            if self.session.doc.fluor.enabled:
+                fluor = self.session.doc.fluor
+                extras += f" Fluorescence is added at full UV, from {fluor.start} to {fluor.full}."
+            caption = (
+                f"Block {asset_id}, a {label}.{palettes} "
+                f"Looking at {where}, {left} on the left and {right} on the right.{extras}"
+            )
+        else:
+            which = f" Variant {self.session.variant_index} of {count}." if count > 1 else ""
+            caption = f"Item {asset_id}.{which} Export writes this icon and an item definition."
+        self.asset_caption.setText(caption)
+
+    def export_asset_definition(self) -> None:
+        kind = self.session.doc.kind
+        if kind not in ("block", "item", "crop"):
+            QMessageBox.information(
+                self,
+                "Export definition",
+                "This file is a texture. Start a block, an item, or a crop to export a definition.",
+            )
+            return
+        asset_id = sanitize_id(self.asset_id.text())
+        default = f"{asset_id}.zip"
+        path, _selected = QFileDialog.getSaveFileName(
+            self,
+            "Export definition",
+            str(Path(self._last_dir()) / default),
+            "Zip archive (*.zip)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+        self._remember_dir(path)
+        try:
+            exported = export_definition(
+                self.session.doc,
+                self.session.library,
+                Path(path),
+                asset_id,
+                self.session.variant_index,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        self.session.message = f"Exported {exported.asset_id} ({len(exported.names)} files)"
+        self.update_status()
+        if exported.errors:
+            QMessageBox.warning(self, "Export finished with script errors", "\n".join(exported.errors))
 
     def _report_export(self, errors: list[str]) -> None:
         self.update_status()

@@ -6,7 +6,7 @@ import math
 
 import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 from .images import numpy_to_qimage
@@ -38,6 +38,7 @@ class CanvasWidget(QWidget):
         self.show_major_grid = True
         self.selection: tuple[int, int, int, int] | None = None
         self.selection_offset = (0, 0)
+        self.face_boxes: tuple[tuple[str, int, int, int, int], ...] = ()
         self._space = False
         self._panning = False
         self._dragging = False
@@ -136,6 +137,7 @@ class CanvasWidget(QWidget):
             self._draw_image(painter, x0, y0, x1, y1, checker=True)
             self._draw_image(painter, x0, y0, x1, y1, checker=False)
             self._draw_grid(painter, x0, y0, x1, y1)
+            self._draw_face_guides(painter)
         self._draw_selection(painter)
         self._draw_hover(painter)
         painter.end()
@@ -192,6 +194,36 @@ class CanvasWidget(QWidget):
             for y in range(start_y, y1 + 1, 16):
                 py = self.pan_y + y * self.zoom
                 painter.drawLine(QPointF(left, py), QPointF(right, py))
+
+    def _draw_face_guides(self, painter: QPainter) -> None:
+        """Name each block face and dim the cells that are not a face."""
+        if not self.face_boxes or self._pixels is None:
+            return
+        height, width = self._pixels.shape[:2]
+        faces = {(x, y): name for name, x, y, _w, _h in self.face_boxes}
+        shade = QColor(10, 10, 12, 150)
+        painter.setBrush(shade)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for ty in range(0, height, 16):
+            for tx in range(0, width, 16):
+                if (tx, ty) in faces:
+                    continue
+                painter.drawRect(
+                    QRectF(self.pan_x + tx * self.zoom, self.pan_y + ty * self.zoom, 16 * self.zoom, 16 * self.zoom)
+                )
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if self.zoom < 6:
+            return
+        font = QFont(painter.font())
+        font.setPixelSize(max(9, int(self.zoom * 0.42)))
+        painter.setFont(font)
+        for name, x, y, _w, _h in self.face_boxes:
+            left = self.pan_x + x * self.zoom
+            top = self.pan_y + y * self.zoom
+            label_h = max(12.0, self.zoom * 0.55)
+            painter.fillRect(QRectF(left, top, 16 * self.zoom, label_h), QColor(12, 12, 14, 170))
+            painter.setPen(QColor(240, 214, 170))
+            painter.drawText(QRectF(left + 3, top, 16 * self.zoom - 6, label_h), Qt.AlignmentFlag.AlignVCenter, name)
 
     def _draw_selection(self, painter: QPainter) -> None:
         if self.selection is None:

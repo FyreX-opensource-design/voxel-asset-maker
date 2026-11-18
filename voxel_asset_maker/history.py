@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .model import Document, Layer
+from .model import BlockTraits, CropTraits, Document, Fluorescence, Layer
 
 
 @dataclass
@@ -17,6 +17,12 @@ class Snapshot:
     active: int
     name: str
     palette: list[str]
+    kind: str
+    ctm: bool
+    ctm_pixels: np.ndarray
+    fluor: Fluorescence
+    traits: BlockTraits
+    crop: CropTraits
     layers: list[Layer]
 
 
@@ -39,6 +45,12 @@ class History:
             active=doc.active_index,
             name=doc.name,
             palette=list(doc.palette),
+            kind=doc.kind,
+            ctm=bool(doc.ctm),
+            ctm_pixels=np.array(doc.ctm_pixels, copy=True),
+            fluor=doc.fluor.copy(),
+            traits=doc.traits.copy(),
+            crop=doc.crop.copy(),
             layers=[layer.clone_state() for layer in doc.layers],
         )
 
@@ -106,6 +118,12 @@ def _restore(doc: Document, snap: Snapshot) -> None:
     doc.height = snap.height
     doc.active_index = snap.active
     doc.name = snap.name
+    doc.kind = snap.kind
+    doc.ctm = bool(snap.ctm)
+    doc.ctm_pixels = np.array(snap.ctm_pixels, copy=True)
+    doc.fluor = snap.fluor.copy()
+    doc.traits = snap.traits.copy()
+    doc.crop = snap.crop.copy()
     doc.palette = list(snap.palette)
     doc.layers = [layer.clone_state() for layer in snap.layers]
     if doc.layers:
@@ -118,6 +136,18 @@ def _same(snap: Snapshot, doc: Document) -> bool:
         or snap.height != doc.height
         or snap.active != doc.active_index
         or snap.name != doc.name
+        or snap.kind != doc.kind
+        or snap.ctm != bool(doc.ctm)
+        or snap.fluor.enabled != doc.fluor.enabled
+        or snap.fluor.mode != doc.fluor.mode
+        or snap.fluor.color != doc.fluor.color
+        or snap.fluor.start != doc.fluor.start
+        or snap.fluor.full != doc.fluor.full
+        or snap.fluor.strength != doc.fluor.strength
+        or not np.array_equal(snap.ctm_pixels, doc.ctm_pixels)
+        or not np.array_equal(snap.fluor.pixels, doc.fluor.pixels)
+        or not _same_traits(snap.traits, doc.traits)
+        or not _same_crop(snap.crop, doc.crop)
         or snap.palette != doc.palette
         or len(snap.layers) != len(doc.layers)
     ):
@@ -130,10 +160,50 @@ def _same(snap: Snapshot, doc: Document) -> bool:
             or left.opacity != right.opacity
             or left.blend != right.blend
             or tuple(left.offset) != tuple(right.offset)
-            or left.script.script_id != right.script.script_id
-            or left.script.script_path != right.script.script_path
-            or left.script.params != right.script.params
+            or not _same_scripts(left.scripts, right.scripts)
             or not np.array_equal(left.pixels, right.pixels)
         ):
+            return False
+    return True
+
+
+def _same_traits(left: BlockTraits, right: BlockTraits) -> bool:
+    return (
+        left.shape == right.shape
+        and left.tab == right.tab
+        and left.hardness == right.hardness
+        and left.tool == right.tool
+        and left.mining_level == right.mining_level
+        and left.sound == right.sound
+        and left.render == right.render
+        and left.solid == right.solid
+        and left.gravity == right.gravity
+        and left.light == right.light
+        and left.full_block == right.full_block
+    )
+
+
+def _same_crop(left: CropTraits, right: CropTraits) -> bool:
+    return (
+        left.stages == right.stages
+        and left.min_time == right.min_time
+        and left.max_time == right.max_time
+        and left.needs_water == right.needs_water
+        and left.water_radius == right.water_radius
+        and left.water_vertical == right.water_vertical
+        and left.seeds == right.seeds
+        and left.produce == right.produce
+        and left.food == right.food
+        and left.ground == right.ground
+        and left.seed_tab == right.seed_tab
+        and left.produce_tab == right.produce_tab
+    )
+
+
+def _same_scripts(left, right) -> bool:
+    if len(left) != len(right):
+        return False
+    for a, b in zip(left, right):
+        if a.script_id != b.script_id or a.script_path != b.script_path or a.params != b.params:
             return False
     return True

@@ -2,7 +2,7 @@
 
 Useful on item and foliage layers. A script in user_scripts/ or
 ~/.voxel-asset-maker/scripts/ with the same shape shows up in the layer
-script list.
+script list. Game definitions go in the definitions folder inside those.
 
 Variant ZIP files use the largest Count in the stack. Give a script a
 count param (or a variant_count function) and read context.variant_index

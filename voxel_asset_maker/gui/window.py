@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -37,35 +39,48 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QTextEdit,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
-from ..blockgame import block_view, export_definition, preview_for, sanitize_id
+from ..blockgame import block_view, export_definition, preview_for, sanitize_id, wood_member_id
+from ..definitions import export_custom
 from ..model import (
     BLOCK_FACE_ORIGIN,
+    block_face_origins,
     BLOCK_RENDERS,
+    BLOCK_ROTATIONS,
     BLOCK_SHAPES,
     BLOCK_SOUNDS,
+    BLOCK_STATIONS,
     BLOCK_TABS,
     BLOCK_TOOLS,
+    DOOR_PARTS,
+    ROTATION_LABELS,
     SHAPE_LABELS,
+    STATION_LABELS,
     TILE,
+    TRAPDOOR_PARTS,
+    WOOD_MEMBERS,
+    WOOD_PARTS,
     BLEND_MODES,
+    LootDrop,
     ctm_at,
     ctm_label,
     ctm_origin,
     ctm_short,
-    face_at,
+    face_on_block,
+    part_at,
     format_hex_color,
     parse_hex_color,
 )
-from ..processors import Param
+from ..processors import Param, palette_colors
 from ..render import render_variant
 from ..session import Session
 from .canvas import CanvasWidget
-from .dialogs import NewTextureDialog, ResizeDialog, ask_text
+from .dialogs import NewDefinitionDialog, NewTextureDialog, ResizeDialog, ask_text
 from .images import numpy_to_qimage, qimage_to_numpy
 from .widgets import PaletteChip, Swatch, tool_icon
 
@@ -84,11 +99,11 @@ Voxel Asset Maker paints block and item textures. Width and height stay multiple
 
 Layers stack from bottom to top. Scripts on a layer run top to bottom, and each one sees the image from the script above it, before the stack is flattened. Result view shows the flattened texture for the variant on the slider. Layer pixels view shows the active layer before its scripts, which is the bitmap you paint.
 
-Noise is texture_noise. Adjust color is texture_adjust. Edge shade and Brightness steps ship as extra scripts. Drop another .py file in user_scripts/ next to the app, or in ~/.voxel-asset-maker/scripts/, then choose Reload scripts. Add puts another script on the same layer.
+Noise is texture_noise. Palette noise picks one color from a set you define for each grain, then shifts that color a little lighter or darker. Adjust color is texture_adjust. Edge shade and Brightness steps ship as extra scripts. Drop another .py file in user_scripts/ next to the app, or in ~/.voxel-asset-maker/scripts/, then choose Reload. Add puts another script on the same layer. On a sheet split into parts, check the parts that script should change. Leave them all unchecked and it runs on the whole layer. Help → Layer scripts describes that file. A game other than block game is a definition file in user_scripts/definitions/, or in ~/.voxel-asset-maker/scripts/definitions/. Help → Custom definitions describes it, and examples/lantern.py is a complete one. Reload picks up both kinds of file. File → New → Minecraft → Block paints a cube for KubeJS. Frames stack down each texture, one width tall, and export writes the startup script, the PNGs, and an mcmeta file when there is more than one frame. Extra variants from a layer script become blockstate variants.
 
 The variant slider and box under the toolbar scrub those variants in Result view. They stay on 1 until a script's Count is above 1. Noise starts at 4. Export PNG writes the variant you're viewing. Export Variant ZIP writes one composited PNG per variant, plus manifest.json. The file count is the highest Count on any script. A Noise script with Count 8 makes eight textures, and a shorter script repeats.
 
-File → New texture, New block, New item, or New crop sets the kind before you draw, and that kind stays with the file. Texture is a free canvas. Block unfolds the cube into six faces — top, bottom, north, south, east, and west — and drawing stays on the face you started the stroke on. Item is one icon. A crop is a row of plant stages, with its grow time, water, seeds, produce, and the soil it roots in. A block can be a cube, slab, vertical slab, stairs, fence, wall, or a plant. A plant is two crossed planes, and you paint that sprite on the south face. The tab and the sound can be any name the game loads. Hardness, tool, mining level, render mode, and the other block fields are part of a block file. A block can also carry connected textures (sixteen tiles, one per neighbor mask) and fluorescence (a glow map or a flat color, with the UV levels where it fades in). Export definition writes a zip with the block or item JSON and its textures. It does not change a block-game checkout. The block preview starts looking from the southeast and turns in quarter steps, including a look at the underside.
+File → New → Texture starts a free canvas. Block, item, crop, door, and trapdoor files are under File → New → Block game → Assets, and that kind stays with the file. A wood set is under File → New → Block game → Sets. It paints log top, log side, a stick, planks, the crafting table's top, front, and side, the door's lower half, upper half, and edge, and the trapdoor panel. Export writes the log, the bark wood block, the stick, planks with both slabs and stairs, the vertical-plank versions of those (the planks texture turned a quarter turn), the crafting table, the door, and the trapdoor. The door edge is the trapdoor edge too. Block unfolds the cube into six faces — top, bottom, north, south, east, and west — and drawing stays on the face you started the stroke on. Faces can instead be one texture for every side, or a column of top, side, and bottom. Item is one icon. A crop is a row of plant stages, with its grow time, water, seeds, produce, the soil it roots in, and the loot a ripe plant drops. An unripe plant drops one seed. A block can be a cube, slab, vertical slab, stairs, fence, wall, or a plant. A plant is two crossed planes, and you paint that sprite on the south face. Rotation is none, axis (a log), or horizontal (a furnace faces you). A crafting table or a furnace can name the recipe types it accepts. A door is the lower half, the upper half, and the thin edge. A trapdoor is the panel and the edge. The tab and the sound can be any name the game loads. Hardness, tool, mining level, render mode, and the other block fields are part of a block file. A block can also carry connected textures (sixteen tiles, one per neighbor mask) and fluorescence (a glow map or a flat color, with the UV levels where it fades in). Export definition writes a zip with the definition and its textures. It does not change a block-game checkout. The block preview starts looking from the southeast and turns in quarter steps, including a look at the underside.
 
 Custom script shape:
 
@@ -119,6 +134,8 @@ class MainWindow(QMainWindow):
         self.preview_yaw = 0
         self.preview_pitch = 0
         self._history_widgets: set[QWidget] = set()
+        self._field_widgets: set[QWidget] = set()
+        self._definition_actions: list[QAction] = []
         self._palette_chips: list[PaletteChip] = []
         self.settings = QSettings("voxel-asset-maker", "VoxelAssetMaker")
 
@@ -146,10 +163,19 @@ class MainWindow(QMainWindow):
         view_menu = self.menuBar().addMenu("View")
         help_menu = self.menuBar().addMenu("Help")
 
-        self._add_action(file_menu, "New texture…", lambda: self.new_texture("texture"), QKeySequence.StandardKey.New)
-        self._add_action(file_menu, "New block…", lambda: self.new_texture("block"))
-        self._add_action(file_menu, "New item…", lambda: self.new_texture("item"))
-        self._add_action(file_menu, "New crop…", lambda: self.new_texture("crop"))
+        new_menu = file_menu.addMenu("New")
+        self.new_menu = new_menu
+        self._add_action(new_menu, "Texture…", lambda: self.new_texture("texture"), QKeySequence.StandardKey.New)
+        block_game = new_menu.addMenu("Block game")
+        assets_menu = block_game.addMenu("Assets")
+        self._add_action(assets_menu, "Block…", lambda: self.new_texture("block"))
+        self._add_action(assets_menu, "Item…", lambda: self.new_texture("item"))
+        self._add_action(assets_menu, "Crop…", lambda: self.new_texture("crop"))
+        self._add_action(assets_menu, "Door…", lambda: self.new_texture("door"))
+        self._add_action(assets_menu, "Trapdoor…", lambda: self.new_texture("trapdoor"))
+        sets_menu = block_game.addMenu("Sets")
+        self._add_action(sets_menu, "Wood…", lambda: self.new_texture("set"))
+        self._rebuild_definition_menus()
         self._add_action(file_menu, "Open project…", self.open_project, QKeySequence.StandardKey.Open)
         self._add_action(file_menu, "Open image…", self.open_image)
         self._add_action(file_menu, "Save", self.save_project, QKeySequence.StandardKey.Save)
@@ -200,6 +226,8 @@ class MainWindow(QMainWindow):
         self._add_action(view_menu, "Zoom out", lambda: self.canvas.zoom_by(-1), QKeySequence.StandardKey.ZoomOut)
 
         self._add_action(help_menu, "How this editor works", self.show_about)
+        self._add_action(help_menu, "Layer scripts", lambda: self.show_doc("layer-scripts.md", "Layer scripts"))
+        self._add_action(help_menu, "Custom definitions", lambda: self.show_doc("definitions.md", "Custom definitions"))
 
     def _add_action(self, menu, label: str, slot, shortcut=None) -> QAction:
         action = QAction(label, self)
@@ -211,6 +239,22 @@ class MainWindow(QMainWindow):
         action.triggered.connect(lambda _checked=False, fn=slot: fn())
         menu.addAction(action)
         return action
+
+    def _rebuild_definition_menus(self) -> None:
+        for action in self._definition_actions:
+            self.new_menu.removeAction(action)
+        self._definition_actions = []
+        for spec in self.session.definitions.ordered():
+            menu = self.new_menu.addMenu(spec.name)
+            if spec.blurb:
+                menu.setToolTip(spec.blurb)
+            self._definition_actions.append(menu.menuAction())
+            for asset in spec.assets:
+                self._add_action(
+                    menu,
+                    f"{asset.label}…",
+                    lambda definition_id=spec.id, asset_id=asset.id: self.new_definition(definition_id, asset_id),
+                )
 
     def _build_toolbar(self) -> None:
         bar = QToolBar()
@@ -431,7 +475,9 @@ class MainWindow(QMainWindow):
         script_row = QHBoxLayout()
         self.script_combo = QComboBox()
         self.reload_scripts_button = QPushButton("Reload")
-        self.reload_scripts_button.setToolTip("Rescan user_scripts and ~/.voxel-asset-maker/scripts.")
+        self.reload_scripts_button.setToolTip(
+            "Rescan user_scripts and ~/.voxel-asset-maker/scripts, including the definitions folders inside them."
+        )
         script_row.addWidget(self.script_combo, 1)
         script_row.addWidget(self.reload_scripts_button)
         script_layout.addLayout(script_row)
@@ -468,7 +514,11 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
         kind_row = QHBoxLayout()
         self.asset_kind = QLabel("Texture")
-        self.asset_kind.setToolTip("Set when the file was created, from File → New texture, New block, New item, or New crop.")
+        self.asset_kind.setToolTip(
+            "Set when the file was created. Texture is File → New → Texture. "
+            "Block, item, crop, door, and trapdoor are File → New → Block game → Assets. "
+            "A wood set is File → New → Block game → Sets."
+        )
         self.asset_id = QLineEdit()
         self.asset_id.setPlaceholderText("asset_id")
         self.asset_id.setToolTip("Id used in the exported definition.")
@@ -480,6 +530,18 @@ class MainWindow(QMainWindow):
         self.asset_preview.setMinimumHeight(128)
         self.asset_preview.setStyleSheet("background: #141418; border: 1px solid #34343a;")
         layout.addWidget(self.asset_preview)
+        self.set_member = QComboBox()
+        self.set_member.setToolTip("Which piece the preview shows. Export writes every piece in the set.")
+        self.set_member.blockSignals(True)
+        for key, label in WOOD_MEMBERS:
+            self.set_member.addItem(label, key)
+        self.set_member.blockSignals(False)
+        self.set_member.currentIndexChanged.connect(self._set_member_changed)
+        layout.addWidget(self.set_member)
+        self.definition_host = QWidget()
+        self.definition_form = QFormLayout(self.definition_host)
+        self.definition_form.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.definition_host)
         self.preview_turn = QWidget()
         turn_row = QHBoxLayout(self.preview_turn)
         turn_row.setContentsMargins(0, 0, 0, 0)
@@ -520,8 +582,34 @@ class MainWindow(QMainWindow):
         self.shape_combo.setToolTip(
             "The block's model. Fences and walls preview the shape you hold. "
             "A plant is two crossed planes painted on the south face. "
-            "Growth stages and soil are a crop, from File → New crop."
+            "Growth stages and soil are a crop, under File → New → Block game → Assets → Crop. "
+            "Doors and trapdoors are their own files in that same menu."
         )
+        self.rotation_combo = QComboBox()
+        for key in BLOCK_ROTATIONS:
+            self.rotation_combo.addItem(ROTATION_LABELS[key], key)
+        self.rotation_combo.setToolTip(
+            "None stays as placed. Axis turns like a log onto the face you click. "
+            "Horizontal faces you, the way a furnace does."
+        )
+        self.station_combo = QComboBox()
+        for key in BLOCK_STATIONS:
+            self.station_combo.addItem(STATION_LABELS[key], key)
+        self.station_combo.setToolTip(
+            "A crafting table opens crafting recipes. A furnace cooks. "
+            "Leave this on none for an ordinary block."
+        )
+        self.recipe_edit = QLineEdit()
+        self.recipe_edit.setPlaceholderText("recipe_type")
+        self.recipe_edit.setToolTip(
+            "Recipe types this station accepts. Separate ids with spaces. "
+            "Leave blank to use the station's usual recipes."
+        )
+        self.cook_spin = QDoubleSpinBox()
+        self.cook_spin.setRange(0.25, 16.0)
+        self.cook_spin.setSingleStep(0.25)
+        self.cook_spin.setDecimals(2)
+        self.cook_spin.setToolTip("How fast a furnace cooks, compared with an ordinary furnace.")
         self.hardness_spin = QDoubleSpinBox()
         self.hardness_spin.setRange(0.0, 100.0)
         self.hardness_spin.setSingleStep(0.5)
@@ -558,6 +646,19 @@ class MainWindow(QMainWindow):
         flag_row.addWidget(self.solid_check)
         flag_row.addWidget(self.gravity_check)
         fields.addRow("Shape", self.shape_combo)
+        self.face_mode = QComboBox()
+        self.face_mode.addItem("Six faces", "six")
+        self.face_mode.addItem("One texture", "all")
+        self.face_mode.addItem("Column", "column")
+        self.face_mode.setToolTip(
+            "Six faces is the unfolded cube. One texture is painted once and used on every face. "
+            "Column is top, side, and bottom."
+        )
+        fields.addRow("Faces", self.face_mode)
+        fields.addRow("Rotation", self.rotation_combo)
+        fields.addRow("Station", self.station_combo)
+        fields.addRow("Recipes", self.recipe_edit)
+        fields.addRow("Cook speed", self.cook_spin)
         fields.addRow("Hardness", self.hardness_spin)
         fields.addRow("Tool", self.tool_combo)
         fields.addRow("Mining", self.mining_spin)
@@ -573,7 +674,7 @@ class MainWindow(QMainWindow):
         self.surface_group.setExclusive(True)
         self.surface_buttons: dict[str, QPushButton] = {}
         for key, label, tip in (
-            ("faces", "Faces", "Paint the six faces of the block."),
+            ("faces", "Faces", "Paint the block textures."),
             ("ctm", "Connections", "Paint the sixteen connected-texture tiles. U up, D down, L left, R right."),
             ("glow", "Glow", "Paint the fluorescence map."),
         ):
@@ -640,8 +741,22 @@ class MainWindow(QMainWindow):
         self.crop_seeds.setPlaceholderText("crop_seeds")
         self.crop_produce = QLineEdit()
         self.crop_produce.setPlaceholderText("same as the crop id")
-        self.crop_food = QSpinBox()
-        self.crop_food.setRange(0, 20)
+        self.crop_loot_host = QWidget()
+        self.crop_loot_rows = QVBoxLayout(self.crop_loot_host)
+        self.crop_loot_rows.setContentsMargins(0, 0, 0, 0)
+        self.crop_loot_rows.setSpacing(4)
+        self.loot_rows: list[QWidget] = []
+        self.crop_loot_add = QPushButton("Add drop")
+        self.crop_loot_add.setToolTip("Add another item a ripe plant can drop.")
+        loot_box = QWidget()
+        loot_layout = QVBoxLayout(loot_box)
+        loot_layout.setContentsMargins(0, 0, 0, 0)
+        loot_layout.addWidget(self.crop_loot_host)
+        loot_layout.addWidget(self.crop_loot_add)
+        loot_box.setToolTip(
+            "What a ripe plant drops. The two counts are the least and the most. "
+            "Leave an item blank to use the produce, then the seeds. An unripe plant drops one seed."
+        )
         self.crop_ground = QLineEdit()
         self.crop_ground.setPlaceholderText("farmland")
         self.crop_ground.setToolTip("Blocks this crop can root in. Separate ids with spaces or commas.")
@@ -666,7 +781,7 @@ class MainWindow(QMainWindow):
         crop_form.addRow("Seed tab", self.crop_seed_tab)
         crop_form.addRow("Produce", self.crop_produce)
         crop_form.addRow("Produce tab", self.crop_produce_tab)
-        crop_form.addRow("Food", self.crop_food)
+        crop_form.addRow("Loot", loot_box)
         crop_form.addRow("Soil", self.crop_ground)
         layout.addWidget(self.crop_extra)
         self.export_definition_button = QPushButton("Export definition…")
@@ -728,6 +843,12 @@ class MainWindow(QMainWindow):
         self.fluor_full.valueChanged.connect(self._fluor_range_changed)
         self.fluor_strength.valueChanged.connect(self._fluor_strength_changed)
         self.shape_combo.currentIndexChanged.connect(self._shape_changed)
+        self.face_mode.currentIndexChanged.connect(self._face_mode_changed)
+        self.rotation_combo.currentIndexChanged.connect(self._block_trait_changed)
+        self.station_combo.currentIndexChanged.connect(self._station_changed)
+        self.recipe_edit.textEdited.connect(self._block_trait_changed)
+        self.recipe_edit.editingFinished.connect(self._recipe_finished)
+        self.cook_spin.valueChanged.connect(self._block_trait_changed)
         self.tool_combo.currentIndexChanged.connect(self._block_trait_changed)
         self.sound_combo.currentTextChanged.connect(self._block_trait_changed)
         self.sound_combo.lineEdit().editingFinished.connect(self._sound_finished)
@@ -740,7 +861,7 @@ class MainWindow(QMainWindow):
         self.crop_water.toggled.connect(self._crop_changed)
         self.crop_radius.valueChanged.connect(self._crop_changed)
         self.crop_vertical.valueChanged.connect(self._crop_changed)
-        self.crop_food.valueChanged.connect(self._crop_changed)
+        self.crop_loot_add.clicked.connect(self._add_loot_row)
         self.crop_seeds.textEdited.connect(self._crop_changed)
         self.crop_produce.textEdited.connect(self._crop_changed)
         self.crop_ground.textEdited.connect(self._crop_changed)
@@ -770,6 +891,11 @@ class MainWindow(QMainWindow):
             self.fluor_full,
             self.fluor_strength,
             self.shape_combo,
+            self.face_mode,
+            self.rotation_combo,
+            self.station_combo,
+            self.recipe_edit,
+            self.cook_spin,
             self.tool_combo,
             self.sound_combo,
             self.render_combo,
@@ -788,7 +914,7 @@ class MainWindow(QMainWindow):
             self.crop_vertical,
             self.crop_seeds,
             self.crop_produce,
-            self.crop_food,
+            self.crop_loot_add,
             self.crop_ground,
             self.crop_seed_tab,
             self.crop_produce_tab,
@@ -815,6 +941,7 @@ class MainWindow(QMainWindow):
         self.filled_shapes.setChecked(self.session.filled_shapes)
         self.filled_shapes.blockSignals(False)
         self._sync_kind()
+        self._sync_definition_fields()
         self._sync_block_extra()
         self._sync_crop()
         self._sync_asset_id()
@@ -868,7 +995,7 @@ class MainWindow(QMainWindow):
         blend_index = self.blend_combo.findText(layer.blend)
         if blend_index >= 0:
             self.blend_combo.setCurrentIndex(blend_index)
-        blocked = self.session.doc.kind in ("block", "crop")
+        blocked = self.session.doc.kind in ("block", "crop", "set", "custom")
         self.offset_x.setEnabled(not blocked)
         self.offset_y.setEnabled(not blocked)
         self.offset_x.setValue(0 if blocked else int(layer.offset[0]))
@@ -886,6 +1013,10 @@ class MainWindow(QMainWindow):
                 label = self.session.library.get(binding.script_id).label
             else:
                 label = binding.script_id
+            if binding.parts:
+                names = {part.id: part.label for part in self.session.sheet_parts()}
+                shown = ", ".join(names.get(part_id, part_id) for part_id in binding.parts)
+                label = f"{label} · {shown}"
             self.script_list.addItem(QListWidgetItem(f"{index + 1}. {label}"))
         if layer.scripts:
             row = max(0, min(self.session.script_index, len(layer.scripts) - 1))
@@ -928,6 +1059,25 @@ class MainWindow(QMainWindow):
             button = QPushButton("Randomize seed")
             button.clicked.connect(self._randomize_seed)
             self.form.addRow("", button)
+        parts = self.session.sheet_parts() if script_id != "none" else ()
+        if parts:
+            host = QWidget()
+            grid = QGridLayout(host)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(2)
+            chosen = set(binding.parts)
+            for index, part in enumerate(parts):
+                box = QCheckBox(part.label)
+                box.setObjectName(f"part-{part.id}")
+                box.setToolTip(part.id)
+                box.setChecked(part.id in chosen)
+                box.toggled.connect(lambda _checked, part_id=part.id: self._toggle_script_part(part_id))
+                self._watch_history(box)
+                grid.addWidget(box, index // 3, index % 3)
+            caption = QLabel("Parts")
+            caption.setToolTip("Checked parts get this script. Leave them all unchecked and it runs on the whole layer.")
+            self.form.addRow(caption, host)
         self._loading = False
 
     def refresh_canvas(self) -> None:
@@ -943,13 +1093,37 @@ class MainWindow(QMainWindow):
             self.canvas.face_boxes = tuple(
                 (str(index + 1), index * TILE, 0, TILE, TILE) for index in range(self.session.doc.crop.stages)
             )
+        elif self.session.doc.kind == "door":
+            self.canvas.face_boxes = tuple(
+                (name, index * TILE, 0, TILE, TILE) for index, name in enumerate(DOOR_PARTS)
+            )
+        elif self.session.doc.kind == "trapdoor":
+            self.canvas.face_boxes = tuple(
+                (name, index * TILE, 0, TILE, TILE) for index, name in enumerate(TRAPDOOR_PARTS)
+            )
+        elif self.session.doc.kind == "set":
+            self.canvas.face_boxes = tuple(
+                (label, index * TILE, 0, TILE, TILE) for index, (_key, label, _caption) in enumerate(WOOD_PARTS)
+            )
+        elif self.session.doc.kind == "custom":
+            tiles = self.session.definitions.tiles_for(self.session.doc) or ()
+            self.canvas.face_boxes = tuple(
+                (tile.label, tile.x, tile.y, tile.w, tile.h) for tile in tiles
+            )
         elif self.session.doc.kind == "block" and self.session.surface != "glow":
+            mode = self.session.doc.traits.faces
+            origins = block_face_origins(mode)
             if self.session.doc.traits.shape == "cross":
-                origin_x, origin_y = BLOCK_FACE_ORIGIN["south"]
-                self.canvas.face_boxes = (("plant", origin_x, origin_y, TILE, TILE),)
+                if mode == "all":
+                    self.canvas.face_boxes = (("plant", 0, 0, TILE, TILE),)
+                elif mode == "column":
+                    self.canvas.face_boxes = (("plant", TILE, 0, TILE, TILE),)
+                else:
+                    origin_x, origin_y = BLOCK_FACE_ORIGIN["south"]
+                    self.canvas.face_boxes = (("plant", origin_x, origin_y, TILE, TILE),)
             else:
                 self.canvas.face_boxes = tuple(
-                    (name, origin_x, origin_y, TILE, TILE) for name, (origin_x, origin_y) in BLOCK_FACE_ORIGIN.items()
+                    (name, origin_x, origin_y, TILE, TILE) for name, (origin_x, origin_y) in origins.items()
                 )
         else:
             self.canvas.face_boxes = ()
@@ -979,6 +1153,7 @@ class MainWindow(QMainWindow):
     def update_errors(self) -> None:
         lines = list(self.session.script_errors)
         lines.extend(self.session.library.errors)
+        lines.extend(self.session.definitions.errors)
         self.error_label.setText("\n".join(lines))
         self.error_label.setVisible(bool(lines))
 
@@ -1001,14 +1176,29 @@ class MainWindow(QMainWindow):
             face = f"    {ctm_label(index)}" if index is not None else "    outside tiles"
         elif doc.kind == "block" and self.session.surface == "glow" and x >= 0:
             face = "    glow"
+        elif doc.kind in ("door", "trapdoor", "set") and x >= 0:
+            if doc.kind == "set":
+                index = part_at(x, y, len(WOOD_PARTS))
+                face = f"    {WOOD_PARTS[index][2]}" if index is not None else "    outside tiles"
+            else:
+                names = DOOR_PARTS if doc.kind == "door" else TRAPDOOR_PARTS
+                index = part_at(x, y, len(names))
+                face = f"    {names[index]}" if index is not None else "    outside tiles"
+        elif doc.kind == "custom" and x >= 0:
+            tiles = self.session.definitions.tiles_for(doc) or ()
+            match = next((tile for tile in tiles if tile.contains(x, y)), None)
+            if tiles:
+                face = f"    {match.caption}" if match is not None else "    outside tiles"
         elif doc.kind == "crop" and x >= 0:
             index = x // TILE
             face = f"    stage {index + 1}" if 0 <= index < doc.crop.stages and 0 <= y < TILE else "    outside stages"
         elif doc.kind == "block" and x >= 0:
-            name = face_at(x, y)
-            if name == "south" and self.session.doc.traits.shape == "cross":
-                name = "plant"
-            elif name and self.session.doc.traits.shape == "cross":
+            mode = doc.traits.faces
+            name = face_on_block(x, y, mode)
+            plant = doc.traits.shape == "cross"
+            if plant and ((mode == "six" and name == "south") or (mode == "column" and name == "side") or mode == "all"):
+                name = "plant" if name else None
+            elif plant and name:
                 name = None
             face = f"    {name}" if name else "    outside faces"
         if self.session.surface == "ctm":
@@ -1340,9 +1530,10 @@ class MainWindow(QMainWindow):
     def _reload_scripts(self) -> None:
         self.session.reload_scripts()
         self._fill_script_combo()
+        self._rebuild_definition_menus()
         self.sync_layer_controls()
         self.refresh_canvas()
-        self.session.message = "Reloaded scripts."
+        self.session.message = "Reloaded scripts and definitions."
         self.update_status()
 
     def _param_widget(self, param: Param, value) -> QWidget:
@@ -1370,6 +1561,8 @@ class MainWindow(QMainWindow):
             return box
         if param.type == "color":
             return self._color_param(param, "" if value is None else str(value))
+        if param.type == "colors":
+            return self._colors_param(param, value)
         if param.type == "text":
             box = QLineEdit("" if value is None else str(value))
             box.editingFinished.connect(lambda key=param.key, edit=box: self._set_param(key, edit.text()))
@@ -1425,6 +1618,113 @@ class MainWindow(QMainWindow):
         layout.addWidget(clear)
         return row
 
+    def _colors_param(self, param: Param, value, *, definition: bool = False) -> QWidget:
+        host = QWidget()
+        grid = QGridLayout(host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        parsed = palette_colors(value if value not in (None, "") else param.default)
+        if not parsed:
+            parsed = palette_colors(param.default)
+        host_colors = [format_hex_color(color) for color in parsed]
+
+        def commit() -> None:
+            text = " ".join(host_colors)
+            self.session.begin_edit()
+            if definition:
+                self.session.set_definition_field(param.key, text)
+            else:
+                self.session.set_script_param(param.key, text)
+            self.session.end_edit()
+            if definition:
+                self.refresh_preview()
+                self.sync_title()
+            else:
+                self._after_param()
+
+        def rebuild() -> None:
+            while grid.count():
+                item = grid.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            columns = 4
+            for index, color in enumerate(host_colors):
+                swatch = QPushButton()
+                swatch.setFixedSize(28, 22)
+                swatch.setToolTip(f"{color}\nClick to change.")
+                swatch.setStyleSheet(f"background: {color}; border: 1px solid #2a2a2e;")
+                swatch.clicked.connect(lambda _checked=False, i=index: edit(i))
+                remove = QPushButton("×")
+                remove.setFixedSize(22, 22)
+                remove.setToolTip(f"Remove {color}")
+                remove.setEnabled(len(host_colors) > 1)
+                remove.clicked.connect(lambda _checked=False, i=index: drop(i))
+                pair = QWidget()
+                pair_layout = QHBoxLayout(pair)
+                pair_layout.setContentsMargins(0, 0, 0, 0)
+                pair_layout.setSpacing(2)
+                pair_layout.addWidget(swatch)
+                pair_layout.addWidget(remove)
+                row, col = divmod(index, columns)
+                grid.addWidget(pair, row, col)
+            add = QPushButton("Add color")
+            add.setToolTip("Add another color the noise can choose.")
+            add.setEnabled(len(host_colors) < 24)
+            add.clicked.connect(add_color)
+            grid.addWidget(add, (len(host_colors) // columns) + 1, 0, 1, columns)
+
+        def edit(index: int) -> None:
+            try:
+                initial = QColor(*parse_hex_color(host_colors[index]))
+            except ValueError:
+                initial = QColor(255, 255, 255, 255)
+            chosen = QColorDialog.getColor(
+                initial,
+                self,
+                param.label,
+                QColorDialog.ColorDialogOption.ShowAlphaChannel,
+            )
+            if not chosen.isValid():
+                return
+            host_colors[index] = format_hex_color(
+                (chosen.red(), chosen.green(), chosen.blue(), chosen.alpha())
+            )
+            commit()
+            QTimer.singleShot(0, rebuild)
+
+        def drop(index: int) -> None:
+            if len(host_colors) <= 1:
+                return
+            del host_colors[index]
+            commit()
+            QTimer.singleShot(0, rebuild)
+
+        def add_color() -> None:
+            if len(host_colors) >= 24:
+                return
+            host_colors.append(host_colors[-1] if host_colors else "#808080")
+            commit()
+            QTimer.singleShot(0, rebuild)
+
+        rebuild()
+        return host
+
+    def _toggle_script_part(self, part_id: str) -> None:
+        if self._loading:
+            return
+        binding = self.session.current_binding()
+        if binding is None:
+            return
+        chosen = [part for part in binding.parts if part != part_id]
+        if part_id not in binding.parts:
+            chosen.append(part_id)
+        self.session.set_script_parts(chosen)
+        self.rebuild_script_list()
+        self.refresh_canvas()
+        self.sync_title()
+
     def _set_param(self, key: str, value) -> None:
         if self._loading:
             return
@@ -1463,6 +1763,38 @@ class MainWindow(QMainWindow):
             dialog.result_kind,
             stages=dialog.result_stages,
         )
+        self.sync_all()
+        self.canvas.fit()
+
+    def new_definition(self, definition_id: str, asset_id: str) -> None:
+        spec = self.session.definitions.get(definition_id)
+        if spec is None:
+            QMessageBox.warning(self, "New asset", f"Definition '{definition_id}' isn't loaded.")
+            return
+        try:
+            asset = spec.asset(asset_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "New asset", str(exc))
+            return
+        if not self._confirm_discard():
+            return
+        dialog = NewDefinitionDialog(spec.name, asset, self)
+        if dialog.exec() != NewDefinitionDialog.DialogCode.Accepted or not dialog.result_name:
+            return
+        self._reset_preview_angle()
+        try:
+            self.session.new_document(
+                asset.width,
+                asset.height,
+                dialog.result_name,
+                None,
+                "custom",
+                definition=definition_id,
+                asset=asset_id,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "New asset", str(exc))
+            return
         self.sync_all()
         self.canvas.fit()
 
@@ -1569,11 +1901,22 @@ class MainWindow(QMainWindow):
 
     def resize_canvas(self) -> None:
         if self.session.doc.kind == "block":
-            self.session.message = "Block faces stay 16×16. Switch the kind to Texture to resize the canvas."
+            self.session.message = (
+                "Each block tile stays 16×16. Faces in the asset panel switches between "
+                "six faces, one texture, and a column."
+            )
             self.update_status()
             return
         if self.session.doc.kind == "crop":
             self.session.message = "A crop grows by its stage count. Change Stages in the Asset panel."
+            self.update_status()
+            return
+        if self.session.doc.kind == "set":
+            self.session.message = "A wood set keeps one tile for each texture. The pieces share those tiles."
+            self.update_status()
+            return
+        if self.session.doc.kind == "custom":
+            self.session.message = "This sheet size comes from the definition. The tiles stay where that file put them."
             self.update_status()
             return
         dialog = ResizeDialog(self.session.doc, self)
@@ -1595,6 +1938,26 @@ class MainWindow(QMainWindow):
 
     def show_about(self) -> None:
         QMessageBox.information(self, "Voxel Asset Maker", ABOUT)
+
+    def show_doc(self, filename: str, title: str) -> None:
+        path = Path(__file__).resolve().parents[2] / "docs" / filename
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, title, str(exc))
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(text)
+        layout.addWidget(view)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(680, 560)
+        dialog.exec()
 
     def undo(self) -> None:
         focused = QApplication.focusWidget()
@@ -1671,9 +2034,10 @@ class MainWindow(QMainWindow):
     # --- events -------------------------------------------------------------
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        if event.type() == QEvent.Type.FocusIn and watched in self._history_widgets and not self._loading:
+        watched_field = watched in self._history_widgets or watched in self._field_widgets
+        if event.type() == QEvent.Type.FocusIn and watched_field and not self._loading:
             self.session.begin_edit()
-        elif event.type() == QEvent.Type.FocusOut and watched in self._history_widgets and not self._loading:
+        elif event.type() == QEvent.Type.FocusOut and watched_field and not self._loading:
             if self.session.end_edit():
                 self.sync_title()
         elif event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
@@ -1848,19 +2212,155 @@ class MainWindow(QMainWindow):
             self.asset_id.setText(auto)
             self.asset_id.blockSignals(False)
         self._asset_id_auto = auto
+        if self.session.doc.kind == "crop":
+            self._refresh_loot_placeholders()
 
     def _asset_id_edited(self, _text: str) -> None:
         self._asset_id_auto = ""
 
+    def _set_member_changed(self, _index: int) -> None:
+        if self._loading:
+            return
+        self.refresh_preview()
+
+    def _member_key(self) -> str:
+        key = self.set_member.currentData()
+        return str(key or "log")
+
+    def _custom_asset(self):
+        doc = self.session.doc
+        if doc.kind != "custom":
+            return None
+        spec = self.session.definitions.get(doc.definition)
+        if spec is None:
+            return None
+        try:
+            return spec, spec.asset(doc.asset)
+        except Exception:
+            return None
+
+    def _sync_definition_fields(self) -> None:
+        for widget in list(self._field_widgets):
+            self._field_widgets.discard(widget)
+        while self.definition_form.rowCount():
+            self.definition_form.removeRow(0)
+        found = self._custom_asset()
+        self.definition_host.setVisible(found is not None and bool(found[1].fields))
+        if found is None:
+            return
+        spec, asset = found
+        values = spec.resolved_fields(asset, self.session.doc.fields)
+        self._loading = True
+        for param in asset.fields:
+            widget = self._field_widget(param, values.get(param.key))
+            label = QLabel(param.label)
+            if param.help:
+                label.setToolTip(param.help)
+                widget.setToolTip(param.help)
+            self.definition_form.addRow(label, widget)
+        self._loading = False
+
+    def _field_widget(self, param, value) -> QWidget:
+        if param.type == "bool":
+            box = QCheckBox()
+            box.setChecked(bool(value))
+            box.toggled.connect(lambda checked, key=param.key: self._set_field(key, bool(checked)))
+            self._watch_field(box)
+            return box
+        if param.type == "choice":
+            box = QComboBox()
+            for choice in param.choices or ():
+                box.addItem(choice)
+            box.setCurrentText(str(value if value is not None else ""))
+            box.currentTextChanged.connect(lambda text, key=param.key: self._set_field(key, text))
+            self._watch_field(box)
+            return box
+        if param.type == "int":
+            box = QSpinBox()
+            box.setRange(_as_int(param.min, -1_000_000), _as_int(param.max, 1_000_000))
+            box.setSingleStep(_as_int(param.step, 1) or 1)
+            box.setValue(_as_int(value, _as_int(param.default, 0)))
+            box.valueChanged.connect(lambda number, key=param.key: self._set_field(key, int(number)))
+            self._watch_field(box)
+            return box
+        if param.type == "text":
+            box = QLineEdit("" if value is None else str(value))
+            box.editingFinished.connect(lambda key=param.key, edit=box: self._set_field(key, edit.text()))
+            self._watch_field(box)
+            return box
+        if param.type == "colors":
+            return self._colors_param(param, value, definition=True)
+        if param.type == "color":
+            button = QPushButton(str(value or "None"))
+
+            def choose(key=param.key, target=button) -> None:
+                initial = QColor(255, 255, 255)
+                if target.text() and target.text() != "None":
+                    try:
+                        initial = QColor(*parse_hex_color(target.text()))
+                    except ValueError:
+                        pass
+                chosen = QColorDialog.getColor(initial, self, param.label)
+                if not chosen.isValid():
+                    return
+                text = f"#{chosen.red():02x}{chosen.green():02x}{chosen.blue():02x}"
+                self.session.begin_edit()
+                self.session.set_definition_field(key, text)
+                self.session.end_edit()
+                target.setText(text)
+                self.refresh_preview()
+                self.sync_title()
+
+            button.clicked.connect(choose)
+            return button
+        box = QDoubleSpinBox()
+        box.setDecimals(3)
+        box.setRange(float(param.min if param.min is not None else -1_000_000), float(param.max if param.max is not None else 1_000_000))
+        box.setSingleStep(float(param.step if param.step is not None else 0.1))
+        try:
+            box.setValue(float(value if value is not None else param.default or 0))
+        except (TypeError, ValueError):
+            box.setValue(0.0)
+        box.valueChanged.connect(lambda number, key=param.key: self._set_field(key, float(number)))
+        self._watch_field(box)
+        return box
+
+    def _watch_field(self, widget: QWidget) -> None:
+        widget.installEventFilter(self)
+        self._field_widgets.add(widget)
+
+    def _set_field(self, key: str, value) -> None:
+        if self._loading:
+            return
+        before = (self.session.doc.width, self.session.doc.height)
+        self.session.set_definition_field(key, value)
+        self.refresh_canvas()
+        if (self.session.doc.width, self.session.doc.height) != before:
+            self.canvas.fit()
+        self.sync_title()
+
     def _sync_kind(self) -> None:
         kind = self.session.doc.kind
-        self.asset_kind.setText(kind.replace("_", " ").capitalize())
-        self.preview_turn.setVisible(kind in ("block", "crop"))
-        self.tab_host.setVisible(kind in ("block", "item"))
-        self.block_extra.setVisible(kind == "block")
+        custom = self._custom_asset()
+        if kind == "set" and self.session.doc.family == "wood":
+            self.asset_kind.setText("Wood set")
+        elif custom is not None:
+            self.asset_kind.setText(custom[0].name)
+        else:
+            self.asset_kind.setText(kind.replace("_", " ").capitalize())
+        opening = kind in ("door", "trapdoor")
+        turns = kind in ("block", "crop", "door", "trapdoor") or (
+            kind == "set" and self._member_key() != "stick"
+        ) or (custom is not None and custom[1].turn)
+        self.preview_turn.setVisible(turns)
+        self.set_member.setVisible(kind == "set")
+        self.tab_host.setVisible(kind in ("block", "item", "door", "trapdoor"))
+        self.block_extra.setVisible(kind == "block" or opening)
         self.crop_extra.setVisible(kind == "crop")
-        self.export_definition_button.setEnabled(kind in ("block", "item", "crop"))
-        if kind in ("block", "item"):
+        self.export_definition_button.setEnabled(
+            kind in ("block", "item", "crop", "door", "trapdoor", "set", "custom")
+        )
+        if kind in ("block", "item", "door", "trapdoor"):
             self._loading = True
             self.tab_combo.setEditText(self.session.doc.traits.tab)
             self._loading = False
@@ -1868,8 +2368,9 @@ class MainWindow(QMainWindow):
     def _sync_block_extra(self) -> None:
         doc = self.session.doc
         block = doc.kind == "block"
-        self.block_extra.setVisible(block)
-        if not block:
+        opening = doc.kind in ("door", "trapdoor")
+        self.block_extra.setVisible(block or opening)
+        if not block and not opening:
             return
         fluor = doc.fluor
         self._loading = True
@@ -1893,6 +2394,11 @@ class MainWindow(QMainWindow):
         self.surface_buttons[surface].setChecked(True)
         traits = doc.traits
         self._select_data(self.shape_combo, traits.shape)
+        self._select_data(self.face_mode, traits.faces)
+        self._select_data(self.rotation_combo, traits.rotation)
+        self._select_data(self.station_combo, traits.station)
+        self.recipe_edit.setText(traits.recipe_types)
+        self.cook_spin.setValue(float(traits.cook_speed))
         self._select_data(self.tool_combo, traits.tool)
         self.sound_combo.setEditText(traits.sound)
         self._select_data(self.render_combo, traits.render)
@@ -1902,12 +2408,28 @@ class MainWindow(QMainWindow):
         self.solid_check.setChecked(bool(traits.solid))
         self.gravity_check.setChecked(bool(traits.gravity))
         self.full_block_edit.setText(traits.full_block)
-        show_full = traits.shape == "vertical_slab"
-        self.full_block_edit.setVisible(show_full)
-        full_label = self._block_fields.labelForField(self.full_block_edit)
-        if full_label is not None:
-            full_label.setVisible(show_full)
+        show_full = block and traits.shape == "vertical_slab"
+        self._show_field(self._block_fields, self.shape_combo, block)
+        self._show_field(self._block_fields, self.face_mode, block)
+        self._show_field(self._block_fields, self.rotation_combo, block)
+        self._show_field(self._block_fields, self.station_combo, block)
+        self._show_field(self._block_fields, self.recipe_edit, block and bool(traits.station))
+        self._show_field(self._block_fields, self.cook_spin, block and traits.station == "furnace")
+        self._show_field(self._block_fields, self.light_spin, block)
+        self._show_field(self._block_fields, self.full_block_edit, show_full)
+        self.gravity_check.setVisible(block)
+        for button in self.surface_buttons.values():
+            button.setVisible(block)
+        self.ctm_check.setVisible(block)
+        self.fluor_check.setVisible(block)
+        self.fluor_options.setVisible(block and fluor.enabled)
         self._loading = False
+
+    def _show_field(self, form: QFormLayout, widget: QWidget, visible: bool) -> None:
+        widget.setVisible(visible)
+        label = form.labelForField(widget)
+        if label is not None:
+            label.setVisible(visible)
 
     def _select_data(self, combo: QComboBox, value: str) -> None:
         index = combo.findData(value)
@@ -1973,6 +2495,16 @@ class MainWindow(QMainWindow):
         self._sync_block_extra()
         self.refresh_canvas()
 
+    def _face_mode_changed(self, _index: int) -> None:
+        if self._loading:
+            return
+        before = (self.session.doc.width, self.session.doc.height)
+        self.session.set_block_trait(faces=str(self.face_mode.currentData() or "six"))
+        self.refresh_canvas()
+        if (self.session.doc.width, self.session.doc.height) != before:
+            self.canvas.fit()
+        self.sync_title()
+
     def _block_trait_changed(self, _value: object = None) -> None:
         if self._loading:
             return
@@ -1985,8 +2517,34 @@ class MainWindow(QMainWindow):
             solid=self.solid_check.isChecked(),
             gravity=self.gravity_check.isChecked(),
             light=int(self.light_spin.value()),
+            rotation=str(self.rotation_combo.currentData() or ""),
+            station=str(self.station_combo.currentData() or ""),
+            recipe_types=self.recipe_edit.text(),
+            cook_speed=float(self.cook_spin.value()),
         )
         self.refresh_preview()
+
+    def _station_changed(self, _index: int) -> None:
+        if self._loading:
+            return
+        station = str(self.station_combo.currentData() or "")
+        changes: dict[str, object] = {"station": station}
+        if station == "furnace" and not self.rotation_combo.currentData():
+            changes["rotation"] = "horizontal"
+        if not station:
+            changes["recipe_types"] = ""
+            changes["cook_speed"] = 1.0
+        self.session.set_block_trait(**changes)
+        self._sync_block_extra()
+        self.refresh_preview()
+
+    def _recipe_finished(self) -> None:
+        if self._loading:
+            return
+        self._block_trait_changed()
+        self._loading = True
+        self.recipe_edit.setText(self.session.doc.traits.recipe_types)
+        self._loading = False
 
     def _tab_edited(self, text: str) -> None:
         if self._loading:
@@ -2018,8 +2576,8 @@ class MainWindow(QMainWindow):
         self.crop_vertical.setValue(int(crop.water_vertical))
         self.crop_seeds.setText(crop.seeds)
         self.crop_produce.setText(crop.produce)
-        self.crop_food.setValue(int(crop.food))
         self.crop_ground.setText(crop.ground)
+        self._rebuild_loot()
         self.crop_seed_tab.setEditText(crop.seed_tab)
         self.crop_produce_tab.setEditText(crop.produce_tab)
         self._loading = False
@@ -2049,12 +2607,121 @@ class MainWindow(QMainWindow):
             water_vertical=int(self.crop_vertical.value()),
             seeds=self.crop_seeds.text(),
             produce=self.crop_produce.text(),
-            food=int(self.crop_food.value()),
+            loot=self._read_loot(),
             ground=self.crop_ground.text(),
             seed_tab=self.crop_seed_tab.currentText(),
             produce_tab=self.crop_produce_tab.currentText(),
         )
+        self._refresh_loot_placeholders()
         self.refresh_preview()
+
+    def _loot_placeholders(self) -> tuple[str, str]:
+        produce = self.crop_produce.text().strip() or self.asset_id.text().strip() or "produce"
+        seeds = self.crop_seeds.text().strip() or f"{produce}_seeds"
+        return produce, seeds
+
+    def _refresh_loot_placeholders(self) -> None:
+        produce, seeds = self._loot_placeholders()
+        for index, row in enumerate(self.loot_rows):
+            hint = produce if index == 0 else seeds if index == 1 else "item_id"
+            row.item.setPlaceholderText(hint)
+
+    def _rebuild_loot(self) -> None:
+        for row in self.loot_rows:
+            for widget in row.watched:
+                self._history_widgets.discard(widget)
+            row.setParent(None)
+            row.deleteLater()
+        self.loot_rows = []
+        produce, seeds = self._loot_placeholders()
+        for index, drop in enumerate(self.session.doc.crop.loot):
+            hint = produce if index == 0 else seeds if index == 1 else "item_id"
+            row = self._make_loot_row(index, drop, hint)
+            self.crop_loot_rows.addWidget(row)
+            self.loot_rows.append(row)
+
+    def _make_loot_row(self, index: int, drop: LootDrop, hint: str) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        item = QLineEdit(drop.item)
+        item.setPlaceholderText(hint)
+        item.setToolTip("Item id. Leave the first row blank to drop the produce, and the second to drop the seeds.")
+        minimum = QSpinBox()
+        minimum.setRange(1, 64)
+        minimum.setValue(int(drop.minimum))
+        minimum.setToolTip("Fewest items in this drop.")
+        maximum = QSpinBox()
+        maximum.setRange(1, 64)
+        maximum.setValue(int(drop.maximum))
+        maximum.setToolTip("Most items in this drop.")
+        chance = QSpinBox()
+        chance.setRange(0, 100)
+        chance.setSuffix("%")
+        chance.setValue(int(round(float(drop.chance) * 100)))
+        chance.setToolTip("Chance this drop is rolled. 100% always drops.")
+        remove = QPushButton("×")
+        remove.setFixedWidth(28)
+        remove.setToolTip("Remove this drop.")
+        for widget in (item, minimum, maximum, chance):
+            widget.setMinimumWidth(0)
+        minimum.setMaximumWidth(54)
+        maximum.setMaximumWidth(54)
+        chance.setMaximumWidth(68)
+        layout.addWidget(item, 1)
+        layout.addWidget(minimum)
+        layout.addWidget(maximum)
+        layout.addWidget(chance)
+        layout.addWidget(remove)
+        row.item = item
+        row.minimum = minimum
+        row.maximum = maximum
+        row.chance = chance
+        row.watched = (item, minimum, maximum, chance, remove)
+        for widget in row.watched:
+            self._watch_history(widget)
+        item.textEdited.connect(self._crop_changed)
+        item.editingFinished.connect(self._crop_finished)
+        minimum.valueChanged.connect(self._crop_changed)
+        maximum.valueChanged.connect(self._crop_changed)
+        chance.valueChanged.connect(self._crop_changed)
+        remove.clicked.connect(lambda _checked=False, row_index=index: self._remove_loot_row(row_index))
+        return row
+
+    def _read_loot(self) -> list[LootDrop]:
+        drops: list[LootDrop] = []
+        for row in self.loot_rows:
+            drops.append(
+                LootDrop(
+                    row.item.text(),
+                    int(row.minimum.value()),
+                    int(row.maximum.value()),
+                    int(row.chance.value()) / 100,
+                )
+            )
+        return drops
+
+    def _add_loot_row(self) -> None:
+        if self._loading:
+            return
+        drops = self._read_loot()
+        drops.append(LootDrop())
+        self.session.set_crop(loot=drops)
+        self._loading = True
+        self._rebuild_loot()
+        self._loading = False
+
+    def _remove_loot_row(self, index: int) -> None:
+        if self._loading:
+            return
+        drops = self._read_loot()
+        if 0 <= index < len(drops):
+            del drops[index]
+        self.session.set_crop(loot=tuple(drops))
+        self._loading = True
+        self._rebuild_loot()
+        self._loading = False
 
     def _crop_finished(self) -> None:
         if self._loading:
@@ -2111,16 +2778,18 @@ class MainWindow(QMainWindow):
 
     def refresh_preview(self) -> None:
         kind = self.session.doc.kind
-        if kind not in ("block", "item", "crop"):
+        member = self._member_key()
+        if kind not in ("block", "item", "crop", "door", "trapdoor", "set", "custom"):
             self.asset_preview.clear()
             self.asset_preview.setText("Texture")
             self.asset_caption.setText(
-                "Texture. Start a block, an item, or a crop from the File menu to draw that asset and export its definition."
+                "Texture. Start a block, an item, a crop, a door, or a trapdoor from "
+                "File → New → Block game → Assets, a wood set from Sets, or another game from its own menu."
             )
             return
         try:
             if kind == "crop":
-                rendered = render_variant(self.session.doc, self.session.variant_index, self.session.library)
+                rendered = render_variant(self.session.doc, self.session.variant_index, self.session.library, self.session.definitions)
                 preview = preview_for(
                     rendered.image,
                     kind,
@@ -2128,8 +2797,42 @@ class MainWindow(QMainWindow):
                     pitch=self.preview_pitch,
                     stage=self.session.stage_index,
                 )
-            elif kind == "block":
-                rendered = render_variant(self.session.doc, self.session.variant_index, self.session.library)
+            elif kind == "custom":
+                rendered = render_variant(self.session.doc, self.session.variant_index, self.session.library, self.session.definitions)
+                spec = self.session.definitions.get(self.session.doc.definition)
+                if spec is None:
+                    raise ValueError(
+                        f"Definition '{self.session.doc.definition}' isn't loaded. "
+                        "Put its file in user_scripts/definitions/ and choose Reload."
+                    )
+                asset = spec.asset(self.session.doc.asset)
+                from ..definitions import DefinitionContext
+
+                fields = spec.resolved_fields(asset, self.session.doc.fields)
+                preview = spec.preview(
+                    rendered.image,
+                    asset,
+                    fields,
+                    DefinitionContext(
+                        asset_id=sanitize_id(self.asset_id.text()),
+                        name=self.session.doc.name,
+                        variant_index=self.session.variant_index,
+                        variant_count=self.session.variant_count(),
+                        yaw=self.preview_yaw,
+                        pitch=self.preview_pitch,
+                    ),
+                )
+            elif kind == "set":
+                rendered = render_variant(self.session.doc, self.session.variant_index, self.session.library, self.session.definitions)
+                preview = preview_for(
+                    rendered.image,
+                    kind,
+                    yaw=self.preview_yaw,
+                    pitch=self.preview_pitch,
+                    member=member,
+                )
+            elif kind in ("block", "door", "trapdoor"):
+                rendered = render_variant(self.session.doc, self.session.variant_index, self.session.library, self.session.definitions)
                 fluor = self.session.doc.fluor
                 glowing = fluor.enabled and fluor.strength > 0
                 preview = preview_for(
@@ -2142,13 +2845,17 @@ class MainWindow(QMainWindow):
                     glow_color=fluor.color if glowing and fluor.mode == "color" else None,
                     glow_strength=fluor.strength if glowing else 0.0,
                     shape=self.session.doc.traits.shape,
+                    faces=self.session.doc.traits.faces,
                 )
             elif self.session.view_mode == "composite":
                 image = self.session.display_array()
                 preview = preview_for(image, kind, yaw=self.preview_yaw, pitch=self.preview_pitch)
             else:
                 image = render_variant(
-                    self.session.doc, self.session.variant_index, self.session.library
+                    self.session.doc,
+                    self.session.variant_index,
+                    self.session.library,
+                    self.session.definitions,
                 ).image
                 preview = preview_for(image, kind, yaw=self.preview_yaw, pitch=self.preview_pitch)
         except Exception as exc:
@@ -2158,7 +2865,15 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap.fromImage(numpy_to_qimage(preview))
         limit = max(96, self.asset_preview.width() - 12)
         if pixmap.width() > limit:
-            pixmap = pixmap.scaledToWidth(limit, Qt.TransformationMode.FastTransformation)
+            smooth = kind in ("block", "crop", "door", "trapdoor") or (kind == "set" and member != "stick") or (
+                kind == "custom" and bool(self._custom_asset() and self._custom_asset()[1].turn)
+            )
+            mode = (
+                Qt.TransformationMode.SmoothTransformation
+                if smooth
+                else Qt.TransformationMode.FastTransformation
+            )
+            pixmap = pixmap.scaledToWidth(limit, mode)
         self.asset_preview.setPixmap(pixmap)
         asset_id = sanitize_id(self.asset_id.text())
         count = self.session.variant_count()
@@ -2176,6 +2891,16 @@ class MainWindow(QMainWindow):
                 f"Crop {asset_id}. Stage {stage} of {crop.stages}, drawn as a plant. "
                 f"Roots in {soil}. Seeds {seeds} on the {crop.seed_tab} tab, "
                 f"produce {produce} on the {crop.produce_tab} tab."
+            )
+        elif kind == "door":
+            caption = (
+                f"Door {asset_id}. Lower, upper, and the thin edge. "
+                "Export writes the block, the door file, the item, and loot that drops the door."
+            )
+        elif kind == "trapdoor":
+            caption = (
+                f"Trapdoor {asset_id}. The panel and the thin edge. "
+                "Export writes the block, the trapdoor file, the item, and loot that drops it."
             )
         elif kind == "block":
             cap, left, right = block_view(self.preview_yaw, self.preview_pitch)
@@ -2197,9 +2922,39 @@ class MainWindow(QMainWindow):
             if self.session.doc.fluor.enabled:
                 fluor = self.session.doc.fluor
                 extras += f" Fluorescence is added at full UV, from {fluor.start} to {fluor.full}."
+            traits = self.session.doc.traits
+            if traits.rotation == "axis":
+                extras += " It rotates like a log."
+            elif traits.rotation == "horizontal":
+                extras += " It faces the way you place it."
+            if traits.station == "furnace":
+                recipes = traits.recipe_types.replace(" ", ", ") or "smelting"
+                extras += f" Furnace recipes: {recipes}."
+            elif traits.station == "crafting_table":
+                recipes = traits.recipe_types.replace(" ", ", ") or "the usual crafting recipes"
+                extras += f" Crafting recipes: {recipes}."
             caption = (
                 f"Block {asset_id}, a {label}.{palettes} "
                 f"Looking at {where}, {left} on the left and {right} on the right.{extras}"
+            )
+        elif kind == "custom":
+            found = self._custom_asset()
+            if found is None:
+                caption = (
+                    f"Custom file '{self.session.doc.definition}'. "
+                    "That definition isn't loaded. Put its .py file in user_scripts/definitions/ and choose Reload."
+                )
+            else:
+                spec, asset = found
+                caption = f"{spec.name} {asset.label}, id {asset_id}. {asset.blurb}".strip()
+        elif kind == "set":
+            piece = wood_member_id(asset_id, member)
+            label = self.set_member.currentText()
+            self.preview_turn.setVisible(member != "stick")
+            caption = (
+                f"Wood set {asset_id}. {label} is {piece}. "
+                "Export writes the log, wood, stick, planks, both slabs, stairs, "
+                "the vertical plank versions, the crafting table, the door, and the trapdoor."
             )
         else:
             which = f" Variant {self.session.variant_index} of {count}." if count > 1 else ""
@@ -2208,11 +2963,11 @@ class MainWindow(QMainWindow):
 
     def export_asset_definition(self) -> None:
         kind = self.session.doc.kind
-        if kind not in ("block", "item", "crop"):
+        if kind not in ("block", "item", "crop", "door", "trapdoor", "set", "custom"):
             QMessageBox.information(
                 self,
                 "Export definition",
-                "This file is a texture. Start a block, an item, or a crop to export a definition.",
+                "This file is a texture. Start a block-game asset, a wood set, or a custom definition to export one.",
             )
             return
         asset_id = sanitize_id(self.asset_id.text())
@@ -2229,13 +2984,23 @@ class MainWindow(QMainWindow):
             path += ".zip"
         self._remember_dir(path)
         try:
-            exported = export_definition(
-                self.session.doc,
-                self.session.library,
-                Path(path),
-                asset_id,
-                self.session.variant_index,
-            )
+            if kind == "custom":
+                exported = export_custom(
+                    self.session.doc,
+                    self.session.definitions,
+                    self.session.library,
+                    Path(path),
+                    asset_id,
+                    self.session.variant_index,
+                )
+            else:
+                exported = export_definition(
+                    self.session.doc,
+                    self.session.library,
+                    Path(path),
+                    asset_id,
+                    self.session.variant_index,
+                )
         except Exception as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
             return

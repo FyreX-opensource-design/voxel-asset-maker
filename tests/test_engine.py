@@ -26,14 +26,17 @@ from voxel_asset_maker.blockgame import (  # noqa: E402
     export_definition,
     slice_faces,
 )
+from voxel_asset_maker.definitions import DefinitionError, DefinitionLibrary, export_custom  # noqa: E402
 from voxel_asset_maker.model import (  # noqa: E402
     BLOCK_FACE_ORIGIN,
     BLOCK_SHEET,
+    WOOD_SHEET,
     Document,
     ctm_label,
     ctm_origin,
     empty_pixels,
     read_ctm,
+    read_face,
     read_stage,
     validate_size,
     write_face,
@@ -159,6 +162,47 @@ class CompositeTests(unittest.TestCase):
         self.assertFalse(np.array_equal(np.array(first), np.array(second)))
         self.assertEqual(first.getpixel((0, 0))[3], 255)
         self.assertEqual(session.variant_count(), 3)
+
+    def test_palette_noise_picks_from_the_given_colors(self) -> None:
+        session = Session(self.library)
+        session.new_document(16, 16, name="stone", fill=(255, 0, 0, 255))
+        session.doc.layers[0].pixels[0, 0] = (255, 0, 0, 0)
+        session.set_script_id("palette")
+        session.set_script_param("colors", "#000000 #ffffff")
+        session.set_script_param("spread", 0)
+        session.set_script_param("seed", 3)
+        session.set_script_param("count", 2)
+        first = render_variant(session.doc, 1, self.library)
+        again = render_variant(session.doc, 1, self.library).image
+        second = render_variant(session.doc, 2, self.library).image
+        self.assertEqual(first.errors, [])
+        self.assertTrue(np.array_equal(np.array(first.image), np.array(again)))
+        self.assertFalse(np.array_equal(np.array(first.image), np.array(second)))
+        colors = {first.image.getpixel((x, y))[:3] for x in range(16) for y in range(16) if not (x == 0 and y == 0)}
+        self.assertEqual(colors, {(0, 0, 0), (255, 255, 255)})
+        self.assertEqual(first.image.getpixel((0, 0))[3], 0)
+        session.set_script_param("spread", 12)
+        drifted = np.array(render_variant(session.doc, 1, self.library).image)
+        opaque = drifted[1:, :, :3].reshape(-1, 3)
+        self.assertTrue(np.all(opaque[:, 0] == opaque[:, 1]))
+        self.assertTrue(np.all(opaque[:, 1] == opaque[:, 2]))
+        distance = np.minimum(opaque[:, 0], 255 - opaque[:, 0])
+        self.assertLessEqual(int(distance.max()), 12)
+        self.assertGreater(int(distance.max()), 0)
+        session.set_script_param("colors", "")
+        missed = render_variant(session.doc, 1, self.library)
+        self.assertTrue(any("Palette noise" in line for line in missed.errors))
+        self.assertEqual(missed.image.getpixel((4, 4))[:3], (255, 0, 0))
+        wood = Session(self.library)
+        wood.new_document(16, 16, name="pine", kind="set", fill=(20, 20, 20, 255))
+        wood.set_script_id("palette")
+        wood.set_script_param("colors", "#000000 #ffffff")
+        wood.set_script_param("spread", 0)
+        wood.set_script_param("seed", 5)
+        wood.set_script_parts(["log_top", "log_side"])
+        sheet = np.array(render_variant(wood.doc, 1, self.library).image)
+        self.assertFalse(np.array_equal(sheet[:, 0:16], sheet[:, 16:32]))
+        self.assertEqual(tuple(int(channel) for channel in sheet[4, 40, :3]), (20, 20, 20))
 
     def test_transparent_pixels_stay_transparent_under_noise(self) -> None:
         session = Session(self.library)
@@ -298,6 +342,16 @@ class BlockGameTests(unittest.TestCase):
         self.assertGreater(len(green), 40)
         self.assertLess(float(red[:, 0].mean()), float(green[:, 0].mean()))
         self.assertEqual(int(preview[0, 0, 3]), 255)
+        edge = cube_preview(top, side, scale=4)
+        solid = edge[..., :3].max(axis=2) > 90
+        crest = []
+        for column in range(edge.shape[1]):
+            rows = np.nonzero(solid[:, column])[0]
+            if len(rows):
+                crest.append(int(rows[0]))
+        steps = np.abs(np.diff(crest))
+        self.assertGreater(len(crest), 20)
+        self.assertLessEqual(int(steps.max()), 2)
 
     def test_preview_turns_to_each_side_and_the_underside(self) -> None:
         def solid(red: int, green: int, blue: int) -> np.ndarray:
@@ -424,6 +478,29 @@ class BlockGameTests(unittest.TestCase):
                 self.assertEqual(south.getpixel((2, 3))[:3], (0, 0, 255))
                 north = Image.open(io.BytesIO(archive.read(block["textures"]["north"] + ".png")))
                 self.assertEqual(north.getpixel((2, 3))[:3], (180, 90, 40))
+            session.set_block_trait(faces="all")
+            self.assertEqual((session.doc.width, session.doc.height), (16, 16))
+            one = export_definition(session.doc, library, folder / "one.zip")
+            with zipfile.ZipFile(one.path) as archive:
+                one_block = json.loads(archive.read("copper_brick.json"))
+                self.assertEqual(set(one_block["textures"].values()), {one_block["textures"]["top"]})
+                self.assertEqual(one_block["textures"]["top"], one_block["textures"]["side"])
+            session.set_block_trait(faces="column")
+            self.assertEqual((session.doc.width, session.doc.height), (48, 16))
+            session.doc.layers[0].pixels[:, 16:32] = (1, 2, 3, 255)
+            column = export_definition(session.doc, library, folder / "column.zip")
+            with zipfile.ZipFile(column.path) as archive:
+                column_block = json.loads(archive.read("copper_brick.json"))
+                self.assertEqual(set(column_block["textures"]), {"top", "side", "bottom"})
+                side = Image.open(io.BytesIO(archive.read(column_block["textures"]["side"] + ".png")))
+                self.assertEqual(side.getpixel((4, 4))[:3], (1, 2, 3))
+                self.assertNotEqual(column_block["textures"]["top"], column_block["textures"]["side"])
+            session.set_block_trait(faces="six")
+            self.assertEqual(tuple(int(channel) for channel in read_face(session.doc.layers[0].pixels, "north")[0, 0])[:3], (1, 2, 3))
+            self.assertEqual(tuple(int(channel) for channel in read_face(session.doc.layers[0].pixels, "east")[0, 0])[:3], (1, 2, 3))
+            save_project(session.doc, folder / "copper.vam")
+            loaded = load_project(folder / "copper.vam")
+            self.assertEqual(loaded.traits.faces, "six")
             session.new_document(16, 16, name="copper_nugget", kind="item", fill=(200, 120, 40, 255))
             item = export_definition(session.doc, library, folder / "nugget.zip")
             with zipfile.ZipFile(item.path) as archive:
@@ -644,10 +721,16 @@ class BlockGameTests(unittest.TestCase):
             ground="farmland, lichen_farmland",
             seed_tab="Magic Crops",
             produce_tab="pantry",
-            food=5,
+            loot=(
+                {"item": "Glow Berry", "min": 2, "max": 2, "chance": 1},
+                {"item": "wheat_seeds", "min": 1, "max": 3, "chance": 0.25},
+            ),
             min_time=200,
             max_time=120,
         )
+        self.assertEqual(session.doc.crop.loot[0].item, "glow_berry")
+        self.assertEqual(session.doc.crop.loot[0].minimum, 2)
+        self.assertEqual(session.doc.crop.loot[1].chance, 0.25)
         self.assertEqual(session.doc.crop.ground, "farmland lichen_farmland")
         self.assertEqual(session.doc.crop.seed_tab, "magic_crops")
         self.assertEqual(session.doc.crop.min_time, 120.0)
@@ -677,11 +760,14 @@ class BlockGameTests(unittest.TestCase):
                 stage = Image.open(io.BytesIO(archive.read("wheat_1.png")))
                 seeds = json.loads(archive.read("wheat_seeds.json"))
                 produce = json.loads(archive.read("wheat.item.json"))
+                ripe = json.loads(archive.read("loot/crops/wheat_ripe.json"))
+                young = json.loads(archive.read("loot/crops/wheat_young.json"))
             self.assertEqual(crop["stages"], 3)
             self.assertEqual(crop["ground"], ["farmland", "lichen_farmland"])
             self.assertEqual(crop["seed_tab"], "magic_crops")
             self.assertEqual(crop["produce_tab"], "pantry")
-            self.assertEqual(crop["food"], 5)
+            self.assertNotIn("food", crop)
+            self.assertEqual(crop["loot_table"], "crops/wheat_ripe")
             self.assertEqual(crop["seeds"], "wheat_seeds")
             self.assertEqual(crop["produce"], "wheat")
             self.assertTrue(crop["needs_water"])
@@ -689,12 +775,26 @@ class BlockGameTests(unittest.TestCase):
             self.assertEqual(seeds["tab"], "magic_crops")
             self.assertEqual(seeds["block"], "wheat_0")
             self.assertEqual(produce["tab"], "pantry")
-            self.assertEqual(produce["food"], 5)
+            self.assertEqual(produce["food"], 0)
+            self.assertEqual(produce["right"], "none")
+            self.assertEqual(
+                ripe["pools"][0]["entries"],
+                [
+                    {"type": "item", "name": "glow_berry", "count": 2},
+                    {"type": "item", "name": "wheat_seeds", "count": [1, 3], "chance": 0.25},
+                ],
+            )
+            self.assertEqual(
+                young["pools"][0]["entries"],
+                [{"type": "item", "name": "wheat_seeds", "count": 1}],
+            )
             save_project(session.doc, folder / "wheat.vam")
             loaded = load_project(folder / "wheat.vam")
             self.assertEqual(loaded.kind, "crop")
             self.assertEqual(loaded.crop.stages, 3)
             self.assertEqual(loaded.crop.produce_tab, "pantry")
+            self.assertEqual(loaded.crop.loot[0].item, "glow_berry")
+            self.assertEqual(loaded.crop.loot[1].maximum, 3)
             self.assertEqual(tuple(int(channel) for channel in read_stage(loaded.layers[0].pixels, 1)[4, 4]), (10, 180, 20, 255))
         session.new_document(16, 16, name="shelf", kind="block")
         session.set_block_trait(tab="Odd Shelves")
@@ -710,6 +810,355 @@ class BlockGameTests(unittest.TestCase):
             with zipfile.ZipFile(exported.path) as archive:
                 item = json.loads(archive.read("spoon.json"))
             self.assertEqual(item["tab"], "tools")
+
+    def test_rotation_station_door_and_trapdoor(self) -> None:
+        library = ScriptLibrary()
+        session = Session(library)
+        session.new_document(16, 16, name="Kiln", kind="block")
+        session.set_block_trait(
+            rotation="horizontal",
+            station="furnace",
+            recipe_types="Kilning, blasting",
+            cook_speed=2,
+        )
+        self.assertEqual(session.doc.traits.rotation, "horizontal")
+        self.assertEqual(session.doc.traits.recipe_types, "kilning blasting")
+        self.assertEqual(session.doc.traits.cook_speed, 2.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            exported = export_definition(session.doc, library, folder / "kiln.zip")
+            with zipfile.ZipFile(exported.path) as archive:
+                block = json.loads(archive.read("kiln.json"))
+            self.assertEqual(block["properties"]["rotation"], "horizontal")
+            self.assertEqual(block["station"], "furnace")
+            self.assertEqual(block["recipe_types"], ["kilning", "blasting"])
+            self.assertEqual(block["cook_speed"], 2)
+            save_project(session.doc, folder / "kiln.vam")
+            loaded = load_project(folder / "kiln.vam")
+            self.assertEqual(loaded.traits.station, "furnace")
+            self.assertEqual(loaded.traits.recipe_types, "kilning blasting")
+
+        session.new_document(16, 16, name="Oak Door", kind="door")
+        self.assertEqual((session.doc.width, session.doc.height), (48, 16))
+        self.assertEqual(session.doc.traits.tool, "axe")
+        self.assertEqual(session.doc.traits.render, "cutout")
+        self.assertEqual(session.doc.traits.sound, "wood")
+        session.fg = (20, 140, 40, 255)
+        session.pointer_down(4, 4, 1)
+        session.pointer_up(4, 4)
+        session.fg = (180, 40, 20, 255)
+        session.pointer_down(20, 4, 1)
+        session.pointer_up(20, 4)
+        self.assertEqual(int(session.doc.layers[0].pixels[4, 36, 3]), 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            exported = export_definition(session.doc, library, folder / "oak_door.zip")
+            with zipfile.ZipFile(exported.path) as archive:
+                block = json.loads(archive.read("oak_door.json"))
+                behavior = json.loads(archive.read("doors/oak_door.json"))
+                item = json.loads(archive.read("items/oak_door.json"))
+                loot = json.loads(archive.read("loot/blocks/oak_door.json"))
+                lower = Image.open(io.BytesIO(archive.read(f"{block['textures']['lower']}.png")))
+                upper = Image.open(io.BytesIO(archive.read(f"{block['textures']['upper']}.png")))
+            self.assertEqual(block["type"], "door")
+            self.assertEqual(block["model"], "door_lower")
+            self.assertEqual(block["properties"]["door"], True)
+            self.assertEqual(set(block["textures"]), {"lower", "upper", "edge"})
+            self.assertEqual(behavior["item"], "oak_door")
+            self.assertTrue(behavior["openable_by_hand"])
+            self.assertEqual(item["right"], "place")
+            self.assertEqual(item["block"], "oak_door")
+            self.assertEqual(loot["pools"][0]["entries"][0]["name"], "oak_door")
+            self.assertEqual(lower.getpixel((4, 4))[:3], (20, 140, 40))
+            self.assertEqual(upper.getpixel((4, 4))[:3], (180, 40, 20))
+            save_project(session.doc, folder / "oak_door.vam")
+            loaded = load_project(folder / "oak_door.vam")
+            self.assertEqual(loaded.kind, "door")
+            self.assertEqual(tuple(int(channel) for channel in loaded.layers[0].pixels[4, 4]), (20, 140, 40, 255))
+
+        session.new_document(16, 16, name="oak_trapdoor", kind="trapdoor")
+        self.assertEqual((session.doc.width, session.doc.height), (32, 16))
+        session.fg = (10, 20, 200, 255)
+        session.pointer_down(2, 2, 1)
+        session.pointer_up(2, 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = export_definition(session.doc, library, Path(tmp) / "oak_trapdoor.zip")
+            with zipfile.ZipFile(exported.path) as archive:
+                block = json.loads(archive.read("oak_trapdoor.json"))
+                behavior = json.loads(archive.read("trapdoors/oak_trapdoor.json"))
+                panel = Image.open(io.BytesIO(archive.read(f"{block['textures']['texture']}.png")))
+            self.assertEqual(block["type"], "trapdoor")
+            self.assertEqual(block["model"], "trapdoor")
+            self.assertEqual(set(block["textures"]), {"texture", "edge"})
+            self.assertEqual(behavior["loot_table"], "blocks/oak_trapdoor")
+            self.assertEqual(panel.getpixel((2, 2))[:3], (10, 20, 200))
+
+    def test_wood_set_exports_the_family(self) -> None:
+        library = ScriptLibrary()
+        session = Session(library)
+        session.new_document(16, 16, name="Pine", kind="set")
+        self.assertEqual(session.doc.kind, "set")
+        self.assertEqual(session.doc.family, "wood")
+        self.assertEqual((session.doc.width, session.doc.height), WOOD_SHEET)
+        session.fg = (9, 8, 7, 255)
+        session.pointer_down(1, 1, 1)
+        session.pointer_up(1, 1)
+        pixels = session.doc.layers[0].pixels
+        self.assertEqual(tuple(int(channel) for channel in pixels[1, 1]), (9, 8, 7, 255))
+        self.assertEqual(int(pixels[1, 17, 3]), 0)
+
+        def fill(index: int, color: tuple[int, int, int, int], spot: tuple[int, int] | None = None) -> None:
+            origin = index * 16
+            if spot is None:
+                pixels[:, origin : origin + 16] = color
+            else:
+                row, col = spot
+                pixels[row, origin + col] = color
+
+        fill(0, (120, 72, 32, 255))
+        fill(1, (80, 48, 24, 255))
+        fill(2, (200, 160, 80, 255))
+        fill(3, (0, 0, 0, 0))
+        fill(3, (210, 170, 90, 255), (0, 0))
+        fill(4, (180, 140, 60, 255))
+        fill(5, (40, 90, 140, 255))
+        fill(6, (140, 90, 40, 255))
+        fill(7, (20, 140, 40, 255))
+        fill(8, (180, 40, 20, 255))
+        fill(9, (30, 30, 30, 255))
+        fill(10, (10, 20, 200, 255))
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            exported = export_definition(session.doc, library, folder / "pine.zip", "pine")
+            with zipfile.ZipFile(exported.path) as archive:
+                manifest = json.loads(archive.read("sets/pine.json"))
+                log = json.loads(archive.read("blocks/pine_log.json"))
+                wood = json.loads(archive.read("blocks/pine_wood.json"))
+                planks = json.loads(archive.read("blocks/pine_planks.json"))
+                slab = json.loads(archive.read("blocks/pine_planks_slab.json"))
+                upright = json.loads(archive.read("blocks/pine_planks_vertical_slab.json"))
+                stairs = json.loads(archive.read("blocks/pine_planks_stairs.json"))
+                vertical = json.loads(archive.read("blocks/vertical_pine_planks.json"))
+                vertical_slab = json.loads(archive.read("blocks/vertical_pine_planks_vertical_slab.json"))
+                table = json.loads(archive.read("blocks/pine_crafting_table.json"))
+                door = json.loads(archive.read("blocks/pine_door.json"))
+                trap = json.loads(archive.read("blocks/pine_trapdoor.json"))
+                door_file = json.loads(archive.read("doors/pine_door.json"))
+                trap_file = json.loads(archive.read("trapdoors/pine_trapdoor.json"))
+                stick = json.loads(archive.read("items/pine_stick.json"))
+                log_item = json.loads(archive.read("items/pine_log.json"))
+                loot = json.loads(archive.read("loot/blocks/pine_planks.json"))
+                top = np.array(Image.open(io.BytesIO(archive.read(f"textures/{log['textures']['top']}.png"))))
+                side = np.array(Image.open(io.BytesIO(archive.read(f"textures/{log['textures']['side']}.png"))))
+                plank_tex = np.array(Image.open(io.BytesIO(archive.read(f"textures/{planks['textures']['top']}.png"))))
+                turned = np.array(Image.open(io.BytesIO(archive.read(f"textures/{vertical['textures']['top']}.png"))))
+                lower = Image.open(io.BytesIO(archive.read(f"textures/{door['textures']['lower']}.png")))
+            self.assertEqual(manifest["set"], "wood")
+            self.assertIn("pine_log", manifest["members"])
+            self.assertIn("vertical_pine_planks_stairs", manifest["members"])
+            self.assertIn("pine_trapdoor", manifest["members"])
+            self.assertEqual(log["properties"]["rotation"], "axis")
+            self.assertEqual(log["textures"]["bottom"], log["textures"]["top"])
+            self.assertNotEqual(log["textures"]["top"], log["textures"]["side"])
+            self.assertEqual(tuple(top[4, 4][:3]), (120, 72, 32))
+            self.assertEqual(tuple(side[4, 4][:3]), (80, 48, 24))
+            self.assertEqual(wood["textures"], {"top": log["textures"]["side"], "side": log["textures"]["side"], "bottom": log["textures"]["side"]})
+            self.assertEqual(wood["tab"], ["building", "natural"])
+            self.assertEqual(slab["type"], "slab")
+            self.assertEqual(slab["hardness"], 1)
+            self.assertEqual(upright["type"], "vertical_slab")
+            self.assertEqual(upright["full_block"], "pine_planks")
+            self.assertEqual(stairs["type"], "stairs")
+            self.assertEqual(planks["textures"]["side"], planks["textures"]["top"])
+            self.assertTrue(np.array_equal(turned, np.rot90(plank_tex, 1)))
+            self.assertFalse(np.array_equal(turned, plank_tex))
+            self.assertEqual(vertical_slab["full_block"], "vertical_pine_planks")
+            self.assertEqual(table["station"], "crafting_table")
+            self.assertEqual(table["hardness"], 2.5)
+            self.assertEqual(table["textures"]["down"], log["textures"]["top"])
+            self.assertEqual(table["textures"]["north"], table["textures"]["south"])
+            self.assertNotEqual(table["textures"]["up"], table["textures"]["north"])
+            self.assertEqual(door["type"], "door")
+            self.assertEqual(trap["type"], "trapdoor")
+            self.assertEqual(trap["textures"]["edge"], door["textures"]["edge"])
+            self.assertEqual(door_file["item"], "pine_door")
+            self.assertEqual(trap_file["textures"]["edge"], door["textures"]["edge"])
+            self.assertEqual(lower.getpixel((4, 4))[:3], (20, 140, 40))
+            self.assertEqual(stick["model"], "flat")
+            self.assertEqual(stick["right"], "none")
+            self.assertEqual(stick["tab"], "materials")
+            self.assertEqual(log_item["model"], "block")
+            self.assertEqual(log_item["right"], "place")
+            self.assertEqual(loot["pools"][0]["entries"][0]["name"], "pine_planks")
+            save_project(session.doc, folder / "pine.vam")
+            loaded = load_project(folder / "pine.vam")
+            self.assertEqual(loaded.kind, "set")
+            self.assertEqual(loaded.family, "wood")
+            self.assertEqual(tuple(int(channel) for channel in loaded.layers[0].pixels[0, 48]), (210, 170, 90, 255))
+
+    def test_custom_definition_exports_and_clips(self) -> None:
+        definitions = DefinitionLibrary(folders=[])
+        definitions.load_file(ROOT / "examples" / "lantern.py")
+        session = Session(definitions=definitions)
+        session.new_document(16, 16, name="Oak Lantern", definition="lantern", asset="lantern")
+        self.assertEqual(session.doc.kind, "custom")
+        self.assertEqual(session.doc.definition, "lantern")
+        self.assertEqual((session.doc.width, session.doc.height), (32, 16))
+        self.assertEqual(session.doc.fields["light"], 12)
+        self.assertIs(session.doc.fields["hang"], True)
+        session.fg = (1, 2, 3, 255)
+        session.pointer_down(2, 2, 1)
+        session.pointer_up(2, 2)
+        pixels = session.doc.layers[0].pixels
+        self.assertEqual(tuple(int(channel) for channel in pixels[2, 2]), (1, 2, 3, 255))
+        self.assertEqual(int(pixels[2, 18, 3]), 0)
+        pixels[:, 0:16] = (20, 30, 40, 255)
+        pixels[:, 16:32] = (50, 60, 70, 255)
+        session.set_definition_field("light", 8)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            exported = export_custom(
+                session.doc, definitions, session.library, folder / "lantern.zip", "oak_lantern"
+            )
+            with zipfile.ZipFile(exported.path) as archive:
+                body = json.loads(archive.read("lanterns/oak_lantern.json"))
+                front = Image.open(io.BytesIO(archive.read("textures/oak_lantern_front.png")))
+                top = Image.open(io.BytesIO(archive.read("textures/oak_lantern_top.png")))
+            self.assertEqual(body["light"], 8)
+            self.assertIs(body["hang"], True)
+            self.assertEqual(body["textures"]["front"], "oak_lantern_front")
+            self.assertEqual(front.getpixel((4, 4))[:3], (20, 30, 40))
+            self.assertEqual(top.getpixel((4, 4))[:3], (50, 60, 70))
+            save_project(session.doc, folder / "lantern.vam")
+            loaded = load_project(folder / "lantern.vam")
+            self.assertEqual(loaded.definition, "lantern")
+            self.assertEqual(loaded.asset, "lantern")
+            self.assertEqual(loaded.fields["light"], 8)
+            self.assertEqual(tuple(int(channel) for channel in loaded.layers[0].pixels[0, 20]), (50, 60, 70, 255))
+        broken = DefinitionLibrary(folders=[])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "broken.py"
+            path.write_text("ASSETS = [\n", encoding="utf-8")
+            library = DefinitionLibrary(folders=[Path(tmp)])
+            self.assertTrue(any("broken.py" in line for line in library.errors))
+        session.doc.definition = "missing"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(DefinitionError):
+                export_custom(session.doc, broken, session.library, Path(tmp) / "nope.zip")
+
+    def test_layer_scripts_and_definitions_use_different_folders(self) -> None:
+        from voxel_asset_maker.definitions import definition_directories, definition_from_path
+        from voxel_asset_maker.processors import ProcessError, processor_from_path
+
+        with self.assertRaises(ProcessError) as script_error:
+            processor_from_path(ROOT / "examples" / "lantern.py")
+        self.assertIn("user_scripts/definitions", str(script_error.exception))
+        with self.assertRaises(DefinitionError) as definition_error:
+            definition_from_path(ROOT / "user_scripts" / "brightness_steps.py")
+        self.assertIn("layer script", str(definition_error.exception))
+        folders = [path.name for path in definition_directories()]
+        self.assertIn("definitions", folders)
+        self.assertTrue(any(path.parent.name == "user_scripts" for path in definition_directories()))
+
+    def test_minecraft_block_exports_frames_variants_and_kubejs(self) -> None:
+        session = Session()
+        self.assertIsNotNone(session.definitions.get("minecraft"))
+        session.new_document(16, 16, name="glowstone", definition="minecraft", asset="block")
+        self.assertEqual((session.doc.width, session.doc.height), (16, 16))
+        session.set_definition_field("frames", 3)
+        session.set_definition_field("frametime", 4)
+        session.set_definition_field("tool", "pickaxe")
+        session.set_definition_field("requires_tool", True)
+        self.assertEqual((session.doc.width, session.doc.height), (16, 48))
+        self.assertEqual([part.id for part in session.sheet_parts()], ["all_1", "all_2", "all_3"])
+        pixels = session.doc.layers[0].pixels
+        pixels[0:16, :] = (10, 20, 30, 255)
+        pixels[16:32, :] = (40, 50, 60, 255)
+        pixels[32:48, :] = (70, 80, 90, 255)
+        session.set_script_id("hsb")
+        session.set_script_param("count", 2)
+        session.set_script_param("hue_step", 120)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            exported = export_custom(session.doc, session.definitions, session.library, folder / "glowstone.zip")
+            self.assertEqual(exported.errors, [])
+            with zipfile.ZipFile(exported.path) as archive:
+                names = set(archive.namelist())
+                script = archive.read("startup_scripts/glowstone.js").decode("utf-8")
+                meta = json.loads(archive.read("assets/kubejs/textures/block/glowstone.png.mcmeta"))
+                state = json.loads(archive.read("assets/kubejs/blockstates/glowstone.json"))
+                model = json.loads(archive.read("assets/kubejs/models/block/glowstone.json"))
+                first = Image.open(io.BytesIO(archive.read("assets/kubejs/textures/block/glowstone.png")))
+                second = Image.open(io.BytesIO(archive.read("assets/kubejs/textures/block/glowstone_2.png")))
+            self.assertIn("assets/kubejs/textures/block/glowstone_2.png.mcmeta", names)
+            self.assertIn("StartupEvents.registry('block'", script)
+            self.assertIn("event.create('glowstone')", script)
+            self.assertIn(".requiresTool(true)", script)
+            self.assertIn("minecraft:mineable/pickaxe", script)
+            self.assertEqual(meta["animation"]["frametime"], 4)
+            self.assertNotIn("interpolate", meta["animation"])
+            self.assertEqual(first.size, (16, 48))
+            self.assertEqual(first.getpixel((4, 4))[:3], (10, 20, 30))
+            self.assertEqual(first.getpixel((4, 20))[:3], (40, 50, 60))
+            self.assertNotEqual(first.getpixel((4, 4))[:3], second.getpixel((4, 4))[:3])
+            self.assertEqual(
+                state["variants"][""],
+                [
+                    {"model": "kubejs:block/glowstone"},
+                    {"model": "kubejs:block/glowstone_2"},
+                ],
+            )
+            self.assertEqual(model["parent"], "minecraft:block/cube_all")
+            self.assertEqual(model["textures"]["all"], "kubejs:block/glowstone")
+        session.set_definition_field("frames", 1)
+        session.set_definition_field("faces", "column")
+        self.assertEqual((session.doc.width, session.doc.height), (48, 16))
+        self.assertEqual([part.id for part in session.sheet_parts()], ["top", "side", "bottom"])
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = export_custom(
+                session.doc, session.definitions, session.library, Path(tmp) / "column.zip"
+            )
+            with zipfile.ZipFile(exported.path) as archive:
+                names = set(archive.namelist())
+                column = json.loads(archive.read("assets/kubejs/models/block/glowstone.json"))
+            self.assertNotIn("assets/kubejs/textures/block/glowstone_top.png.mcmeta", names)
+            self.assertEqual(column["parent"], "minecraft:block/cube_bottom_top")
+            self.assertEqual(column["textures"]["side"], "kubejs:block/glowstone_side")
+
+    def test_script_can_target_one_part(self) -> None:
+        definitions = DefinitionLibrary(folders=[])
+        definitions.load_file(ROOT / "examples" / "lantern.py")
+        session = Session(definitions=definitions)
+        session.new_document(16, 16, name="Oak Lantern", definition="lantern", asset="lantern")
+        pixels = session.doc.layers[0].pixels
+        pixels[:, 0:16] = (200, 100, 50, 255)
+        pixels[:, 16:32] = (10, 20, 30, 255)
+        session.add_script("hsb")
+        session.set_script_param("brightness", 0)
+        session.set_script_parts(["front"])
+        limited = render_variant(session.doc, 1, session.library, session.definitions)
+        self.assertEqual(limited.image.getpixel((4, 4))[:3], (0, 0, 0))
+        self.assertEqual(limited.image.getpixel((20, 4))[:3], (10, 20, 30))
+        self.assertEqual(limited.errors, [])
+        session.set_script_parts([])
+        whole = render_variant(session.doc, 1, session.library, session.definitions).image
+        self.assertEqual(whole.getpixel((4, 4))[:3], (0, 0, 0))
+        self.assertEqual(whole.getpixel((20, 4))[:3], (0, 0, 0))
+        session.set_script_parts(["top", "front"])
+        self.assertEqual(session.current_binding().parts, ("front", "top"))
+        session.doc.layers[0].scripts[0].parts = ("missing",)
+        missed = render_variant(session.doc, 1, session.library, session.definitions)
+        self.assertEqual(missed.image.getpixel((4, 4))[:3], (200, 100, 50))
+        self.assertTrue(any("chosen parts" in line for line in missed.errors))
+        wood = Session()
+        wood.new_document(16, 16, name="pine", kind="set")
+        self.assertIn("log_top", [part.id for part in wood.sheet_parts()])
+        with tempfile.TemporaryDirectory() as tmp:
+            session.set_script_parts(["front"])
+            path = Path(tmp) / "lantern.vam"
+            save_project(session.doc, path)
+            loaded = load_project(path)
+            self.assertEqual(loaded.layers[0].scripts[0].parts, ("front",))
 
 
 class CliTests(unittest.TestCase):

@@ -10,23 +10,37 @@ from typing import Any
 
 import numpy as np
 
+from .definitions import DefinitionError, DefinitionLibrary
 from .history import History
 from .model import (
     BLOCK_FACE_ORIGIN,
     BLOCK_SHEET,
+    DOOR_SHEET,
+    TRAPDOOR_SHEET,
+    WOOD_PARTS,
+    WOOD_SHEET,
     TILE,
+    BlockTraits,
     Color,
     CropTraits,
     Document,
     Layer,
     ScriptBinding,
+    block_face_origins,
     block_sheet_from_image,
+    block_sheet_size,
     ctm_at,
     ctm_origin,
     empty_pixels,
     face_at,
+    face_on_block,
     mask_block_faces,
+    part_at,
     read_face,
+    relayout_block_pixels,
+    remap_block_parts,
+    resolve_cube_faces,
+    refit,
     stage_at,
     validate_size,
     write_face,
@@ -59,8 +73,13 @@ from .storage import (
 
 
 class Session:
-    def __init__(self, library: ScriptLibrary | None = None) -> None:
+    def __init__(
+        self,
+        library: ScriptLibrary | None = None,
+        definitions: DefinitionLibrary | None = None,
+    ) -> None:
         self.library = library or ScriptLibrary()
+        self.definitions = definitions if definitions is not None else DefinitionLibrary()
         self.doc = Document(16, 16, name="texture")
         self.history = History()
         self.selection: Rect | None = None
@@ -87,6 +106,7 @@ class Session:
 
     def replace_document(self, doc: Document, path: Path | None, message: str = "") -> None:
         self.doc = doc
+        self._apply_definition_sheet()
         self.path = path
         self.selection = None
         self.surface = "faces"
@@ -108,8 +128,31 @@ class Session:
         fill: Color | None = None,
         kind: str = "texture",
         stages: int = 4,
+        definition: str = "",
+        asset: str = "",
     ) -> None:
         kind = (kind or "texture").strip().lower() or "texture"
+        if definition or kind == "custom":
+            spec = self.definitions.get(definition)
+            if spec is None:
+                raise ValueError(f"Definition '{definition}' isn't loaded.")
+            try:
+                desc = spec.asset(asset)
+            except DefinitionError as exc:
+                raise ValueError(str(exc)) from exc
+            pixels = empty_pixels(desc.width, desc.height, fill)
+            doc = Document(
+                desc.width,
+                desc.height,
+                name=name.strip() or desc.label,
+                layers=[Layer("base", pixels)],
+                kind="custom",
+                definition=spec.id,
+                asset=desc.id,
+                fields=spec.resolved_fields(desc, {}),
+            )
+            self.replace_document(doc, None)
+            return
         if kind == "crop":
             count = int(np.clip(int(stages), 2, 16))
             width, height = count * TILE, TILE
@@ -121,6 +164,39 @@ class Session:
                 layers=[Layer("base", pixels)],
                 kind="crop",
                 crop=CropTraits(stages=count),
+            )
+            self.replace_document(doc, None)
+            return
+        if kind == "set":
+            width, height = WOOD_SHEET
+            pixels = empty_pixels(width, height, fill)
+            doc = Document(
+                width,
+                height,
+                name=name.strip() or "wood",
+                layers=[Layer("base", pixels)],
+                kind="set",
+                family="wood",
+            )
+            self.replace_document(doc, None)
+            return
+        if kind in ("door", "trapdoor"):
+            width, height = DOOR_SHEET if kind == "door" else TRAPDOOR_SHEET
+            pixels = empty_pixels(width, height, fill)
+            doc = Document(
+                width,
+                height,
+                name=name.strip() or kind,
+                layers=[Layer("base", pixels)],
+                kind=kind,
+                traits=BlockTraits(
+                    tab="building",
+                    hardness=3.0,
+                    tool="axe",
+                    sound="wood",
+                    render="cutout",
+                    solid=True,
+                ),
             )
             self.replace_document(doc, None)
             return
@@ -161,7 +237,7 @@ class Session:
             self.doc.width, self.doc.height = BLOCK_SHEET
         elif previous == "block" and kind == "item":
             for layer in self.doc.layers:
-                layer.pixels = read_face(layer.pixels, "south")
+                layer.pixels = resolve_cube_faces(layer.pixels, self.doc.traits.faces)["south"]
                 layer.offset = (0, 0)
             self.doc.width, self.doc.height = TILE, TILE
         self.doc.kind = kind
@@ -240,11 +316,25 @@ class Session:
             "gravity",
             "light",
             "full_block",
+            "rotation",
+            "station",
+            "recipe_types",
+            "cook_speed",
+            "faces",
         )
+        previous = traits.faces
         for key, value in changes.items():
             if key in allowed:
                 setattr(traits, key, value)
         traits.__post_init__()
+        if self.doc.kind == "block" and traits.faces != previous:
+            shape = traits.shape
+            for layer in self.doc.layers:
+                layer.pixels = relayout_block_pixels(layer.pixels, previous, traits.faces, shape)
+                for binding in layer.scripts:
+                    binding.parts = remap_block_parts(binding.parts, traits.faces)
+            self.doc.width, self.doc.height = block_sheet_size(traits.faces)
+            self.selection = None
         self.invalidate()
 
     def set_crop(self, **changes: object) -> None:
@@ -258,7 +348,7 @@ class Session:
             "water_vertical",
             "seeds",
             "produce",
-            "food",
+            "loot",
             "ground",
             "seed_tab",
             "produce_tab",
@@ -319,7 +409,10 @@ class Session:
         from .model import refit
 
         if self.doc.kind == "block":
-            self.message = "Block faces stay 16×16. Switch the kind to Texture to resize the canvas."
+            self.message = (
+                "Each block tile stays 16×16. Faces in the asset panel switches between "
+                "six faces, one texture, and a column."
+            )
             return
         if self.doc.kind == "crop":
             self.message = "A crop grows by its stage count. Change Stages in the Asset panel."
@@ -402,7 +495,7 @@ class Session:
             shown = self._pixels()
         else:
             try:
-                result = render_variant(self.doc, self.variant_index, self.library)
+                result = render_variant(self.doc, self.variant_index, self.library, self.definitions)
                 self.script_errors = list(result.errors)
                 shown = np.array(result.image, dtype=np.uint8)
             except Exception as exc:
@@ -554,6 +647,29 @@ class Session:
         self._clamp_variant()
         self.invalidate()
 
+    def sheet_parts(self):
+        from .model import sheet_parts
+
+        tiles = self.definitions.tiles_for(self.doc) or ()
+        return sheet_parts(self.doc, tiles)
+
+    def set_script_parts(self, parts: list[str] | tuple[str, ...]) -> None:
+        """Limit the selected script to these part ids. Empty means the whole sheet."""
+        binding = self.current_binding()
+        if binding is None:
+            return
+        known = [part.id for part in self.sheet_parts()]
+        chosen: list[str] = []
+        for part_id in parts:
+            token = str(part_id)
+            if token in known and token not in chosen:
+                chosen.append(token)
+        ordered = tuple(part_id for part_id in known if part_id in chosen)
+        if ordered == tuple(binding.parts):
+            return
+        binding.parts = ordered
+        self.invalidate()
+
     def set_script_param(self, key: str, value: Any) -> None:
         binding = self.current_binding()
         if binding is None:
@@ -605,9 +721,49 @@ class Session:
 
     def reload_scripts(self) -> None:
         self.library.reload()
+        self.definitions.reload()
         self._remember_script_paths()
         self._clamp_variant()
         self.invalidate()
+
+    def set_definition_field(self, key: str, value: object) -> None:
+        if self.doc.kind != "custom":
+            return
+        spec = self.definitions.get(self.doc.definition)
+        if spec is None:
+            return
+        try:
+            asset = spec.asset(self.doc.asset)
+        except DefinitionError:
+            return
+        fields = spec.resolved_fields(asset, {**self.doc.fields, key: value})
+        if fields == self.doc.fields:
+            return
+        self.doc.fields = fields
+        self._apply_definition_sheet()
+        self.invalidate()
+
+    def _apply_definition_sheet(self) -> None:
+        """Grow or shrink a custom sheet when its definition layout changes."""
+        if self.doc.kind != "custom":
+            return
+        spec = self.definitions.get(self.doc.definition)
+        if spec is None:
+            return
+        try:
+            asset = spec.asset(self.doc.asset)
+            fields = spec.resolved_fields(asset, self.doc.fields)
+            sheet = spec.sheet(asset, fields)
+        except DefinitionError:
+            return
+        self.doc.fields = fields
+        if sheet.width == self.doc.width and sheet.height == self.doc.height:
+            return
+        for layer in self.doc.layers:
+            layer.pixels = refit(layer.pixels, sheet.width, sheet.height, "topleft")
+        self.doc.width = sheet.width
+        self.doc.height = sheet.height
+        self.selection = None
 
     # --- painting -----------------------------------------------------------
 
@@ -811,7 +967,7 @@ class Session:
     # --- export -------------------------------------------------------------
 
     def export_png(self, path: Path) -> list[str]:
-        errors = export_png(self.doc, path, self.variant_index, self.library)
+        errors = export_png(self.doc, path, self.variant_index, self.library, self.definitions)
         count = self.variant_count()
         if count > 1:
             self.message = f"Exported variant {self.variant_index} of {count} to {Path(path).name}"
@@ -820,7 +976,7 @@ class Session:
         return errors
 
     def export_zip(self, path: Path) -> tuple[list[str], list[str]]:
-        names, errors = export_variant_zip(self.doc, path, self.library)
+        names, errors = export_variant_zip(self.doc, path, self.library, self.definitions)
         self.message = f"Wrote {len(names)} texture{'s' if len(names) != 1 else ''} to {Path(path).name}"
         return names, errors
 
@@ -861,7 +1017,10 @@ class Session:
             return False
         if self.surface == "ctm" and self.doc.kind == "block" and self.doc.ctm:
             return True
-        if self.doc.kind == "crop":
+        if self.doc.kind in ("crop", "door", "trapdoor", "set"):
+            return True
+        tiles = self.definitions.tiles_for(self.doc)
+        if tiles:
             return True
         return self.doc.kind == "block" and self.surface == "faces"
 
@@ -886,12 +1045,32 @@ class Session:
             if self.selection is None:
                 return cell
             return _intersect(self.selection, cell)
+        tiles = self.definitions.tiles_for(self.doc)
+        if tiles:
+            for tile in tiles:
+                if tile.contains(x, y):
+                    cell = (tile.x, tile.y, tile.w, tile.h)
+                    if self.selection is None:
+                        return cell
+                    return _intersect(self.selection, cell)
+            return None
+        if self.doc.kind in ("door", "trapdoor", "set"):
+            count = len(WOOD_PARTS) if self.doc.kind == "set" else (3 if self.doc.kind == "door" else 2)
+            index = part_at(x, y, count)
+            if index is None:
+                return None
+            cell = (index * TILE, 0, TILE, TILE)
+            if self.selection is None:
+                return cell
+            return _intersect(self.selection, cell)
         if self.doc.kind != "block":
             return self.selection
-        name = face_at(x, y)
-        if name is None or (self.doc.traits.shape == "cross" and name != "south"):
+        mode = self.doc.traits.faces
+        name = face_on_block(x, y, mode)
+        plant = self.doc.traits.shape == "cross"
+        if name is None or (plant and mode == "six" and name != "south") or (plant and mode == "column" and name != "side"):
             return None
-        origin_x, origin_y = BLOCK_FACE_ORIGIN[name]
+        origin_x, origin_y = block_face_origins(mode)[name]
         face = (origin_x, origin_y, TILE, TILE)
         if self.selection is None:
             return face

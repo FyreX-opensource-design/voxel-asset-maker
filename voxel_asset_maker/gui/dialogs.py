@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..model import BLOCK_SHEET, TILE, Color, Document
+from ..model import BLOCK_SHEET, DOOR_SHEET, TILE, TRAPDOOR_SHEET, WOOD_SHEET, Color, Document
 
 PRESETS: tuple[tuple[str, int | None, int | None], ...] = (
     ("16 × 16 block", 16, 16),
@@ -49,6 +49,9 @@ class NewTextureDialog(QDialog):
         self.kind.addItem("Block", "block")
         self.kind.addItem("Item", "item")
         self.kind.addItem("Crop", "crop")
+        self.kind.addItem("Door", "door")
+        self.kind.addItem("Trapdoor", "trapdoor")
+        self.kind.addItem("Wood set", "set")
         self.kind.setToolTip(
             "Chosen for this new file. A block is drawn as six faces. "
             "A crop is a row of plant stages. Block, item, and crop files export a definition."
@@ -101,21 +104,37 @@ class NewTextureDialog(QDialog):
         self._kind_changed()
         self.resize(360, 260)
 
+    def _set_size(self, width: int, height: int) -> None:
+        self.width.blockSignals(True)
+        self.height.blockSignals(True)
+        self.width.setValue(width)
+        self.height.setValue(height)
+        self.width.blockSignals(False)
+        self.height.blockSignals(False)
+
     def _lock_name(self) -> None:
         self._name_auto = False
 
     def _kind_changed(self) -> None:
         kind = str(self.kind.currentData() or "texture")
-        titles = {"texture": "New texture", "block": "New block", "item": "New item", "crop": "New crop"}
+        titles = {
+            "texture": "New texture",
+            "block": "New block",
+            "item": "New item",
+            "crop": "New crop",
+            "door": "New door",
+            "trapdoor": "New trapdoor",
+            "set": "New wood set",
+        }
         self.setWindowTitle(titles.get(kind, "New texture"))
         if self._name_auto:
-            self.name.setText(kind)
+            self.name.setText("wood" if kind == "set" else kind)
         show_stages = kind == "crop"
         self.stages.setVisible(show_stages)
         stages_label = self._form.labelForField(self.stages)
         if stages_label is not None:
             stages_label.setVisible(show_stages)
-        locked = kind in ("block", "crop")
+        locked = kind in ("block", "crop", "door", "trapdoor", "set")
         self.preset.setEnabled(not locked)
         self.width.setEnabled(not locked)
         self.height.setEnabled(not locked)
@@ -128,6 +147,22 @@ class NewTextureDialog(QDialog):
             self.height.blockSignals(False)
             self.hint.setText("A crop is a row of 16×16 plant stages, plus the soil it roots in.")
             return
+        if kind == "door":
+            self._set_size(*DOOR_SHEET)
+            self.hint.setText("A door is the lower half, the upper half, and the thin edge.")
+            return
+        if kind == "trapdoor":
+            self._set_size(*TRAPDOOR_SHEET)
+            self.hint.setText("A trapdoor is the panel and the thin edge.")
+            return
+        if kind == "set":
+            self._set_size(*WOOD_SHEET)
+            self.hint.setText(
+                "A wood set paints log top, log side, a stick, planks, the crafting table "
+                "top, front, and side, the door halves and edge, and the trapdoor. "
+                "The name is the wood id, so pine becomes pine_log and pine_planks."
+            )
+            return
         if locked:
             self.width.blockSignals(True)
             self.height.blockSignals(True)
@@ -135,7 +170,10 @@ class NewTextureDialog(QDialog):
             self.height.setValue(BLOCK_SHEET[1])
             self.width.blockSignals(False)
             self.height.blockSignals(False)
-            self.hint.setText("A block is six 16×16 faces: top, bottom, north, south, east, and west.")
+            self.hint.setText(
+                "A block starts as six 16×16 faces: top, bottom, north, south, east, and west. "
+                "Faces in the asset panel can switch that to one texture or a column of top, side, and bottom."
+            )
             return
         if kind == "item":
             self.hint.setText("An item is one icon. 16×16 matches a block-game slot.")
@@ -207,6 +245,18 @@ class NewTextureDialog(QDialog):
             self.result_size = BLOCK_SHEET
             self.accept()
             return
+        if self.result_kind == "door":
+            self.result_size = DOOR_SHEET
+            self.accept()
+            return
+        if self.result_kind == "trapdoor":
+            self.result_size = TRAPDOOR_SHEET
+            self.accept()
+            return
+        if self.result_kind == "set":
+            self.result_size = WOOD_SHEET
+            self.accept()
+            return
         width = self.width.value()
         height = self.height.value()
         if width % TILE or height % TILE:
@@ -265,6 +315,38 @@ def _size_box() -> QSpinBox:
     box.setValue(16)
     box.setSuffix(" px")
     return box
+
+
+class NewDefinitionDialog(QDialog):
+    """Name for a new asset from a custom definition. The sheet size is fixed."""
+
+    def __init__(self, game_name: str, asset: object, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        label = str(getattr(asset, "label", "Asset"))
+        self.setWindowTitle(f"New {label}")
+        self.result_name = ""
+        self.name = QLineEdit(str(getattr(asset, "id", "asset")))
+        self.name.setToolTip("Becomes the id in the exported files.")
+        size = QLabel(f"{getattr(asset, 'width', 16)} × {getattr(asset, 'height', 16)}")
+        hint = QLabel(str(getattr(asset, "blurb", "") or game_name))
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        form = QFormLayout()
+        form.addRow("Game", QLabel(game_name))
+        form.addRow("Name", self.name)
+        form.addRow("Size", size)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(hint)
+        layout.addWidget(buttons)
+        self.resize(360, 200)
+
+    def _accept(self) -> None:
+        self.result_name = self.name.text().strip() or "asset"
+        self.accept()
 
 
 def ask_text(parent: QWidget, title: str, label: str, text: str) -> str | None:

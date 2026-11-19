@@ -7,6 +7,8 @@ with PARAMS and apply(image, params, context) can be attached to a layer too.
 from __future__ import annotations
 
 import importlib.util
+import math
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +19,8 @@ from PIL import Image
 from . import bootstrap  # noqa: F401
 import texture_adjust
 import texture_noise
+
+from .model import format_hex_color, parse_hex_color
 
 BUNDLED_DIR = Path(__file__).resolve().parent / "bundled_scripts"
 MAX_VARIANTS = 256
@@ -33,6 +37,8 @@ class ScriptContext:
     variant_index / variant_count are this script's own series (1-based).
     export_index / export_count are the composited ZIP being written.
     When this script's count is shorter than the export, variant_index cycles.
+    part is the tile id when the script is limited to parts, otherwise empty.
+    width and height match the image passed in, which is that tile or the layer.
     """
 
     variant_index: int
@@ -42,6 +48,7 @@ class ScriptContext:
     width: int
     height: int
     layer_name: str
+    part: str = ""
 
 
 @dataclass
@@ -173,6 +180,75 @@ def _noise_apply(image: Image.Image, params: dict[str, Any], context: ScriptCont
     )
 
 
+def palette_colors(value: Any) -> list[tuple[int, int, int, int]]:
+    """Read a color set from a string, or from a list of strings.
+
+    Separators are spaces, commas, and semicolons. A token that is not a
+    hex color is skipped.
+    """
+    if isinstance(value, (list, tuple)):
+        pieces = [str(item) for item in value]
+    else:
+        pieces = ["" if value is None else str(value)]
+    colors: list[tuple[int, int, int, int]] = []
+    for piece in pieces:
+        for token in piece.replace(",", " ").replace(";", " ").split():
+            try:
+                colors.append(parse_hex_color(token))
+            except ValueError:
+                continue
+    return colors
+
+
+def format_palette(value: Any) -> str:
+    return " ".join(format_hex_color(color) for color in palette_colors(value))
+
+
+def _palette_apply(image: Image.Image, params: dict[str, Any], context: ScriptContext) -> Image.Image:
+    colors = palette_colors(params.get("colors"))
+    if not colors:
+        raise ProcessError("Palette noise needs at least one color, like #6e655d #8a8178.")
+    try:
+        spread = int(float(params.get("spread", 10)))
+    except (TypeError, ValueError):
+        spread = 10
+    spread = max(0, min(64, spread))
+    try:
+        grain = int(params.get("grain_size", 1))
+    except (TypeError, ValueError):
+        grain = 1
+    grain = max(1, grain)
+    try:
+        seed = int(params.get("seed") or 0)
+    except (TypeError, ValueError):
+        seed = 0
+    mixed = (seed + int(context.variant_index) * 1_000_003) & 0xFFFFFFFF
+    part = str(getattr(context, "part", "") or "")
+    if part:
+        mixed = (mixed ^ zlib.crc32(part.encode("utf-8"))) & 0xFFFFFFFF
+    rng = np.random.default_rng(mixed)
+    source = np.array(image.convert("RGBA"), dtype=np.uint8)
+    height, width = source.shape[:2]
+    cells_y = max(1, math.ceil(height / grain))
+    cells_x = max(1, math.ceil(width / grain))
+    pick = rng.integers(0, len(colors), size=(cells_y, cells_x))
+    shade = rng.integers(-spread, spread + 1, size=(cells_y, cells_x))
+    if grain != 1:
+        pick = np.repeat(np.repeat(pick, grain, axis=0), grain, axis=1)[:height, :width]
+        shade = np.repeat(np.repeat(shade, grain, axis=0), grain, axis=1)[:height, :width]
+    table = np.asarray(colors, dtype=np.int16)
+    chosen = table[pick]
+    rgb = np.clip(chosen[..., :3] + shade.astype(np.int16)[..., None], 0, 255).astype(np.uint8)
+    out = np.array(source, copy=True)
+    if bool(params.get("preserve_alpha", True)):
+        mask = source[..., 3] > 0
+        out[mask, :3] = rgb[mask]
+    else:
+        out[..., :3] = rgb
+        out[..., 3] = chosen[..., 3].astype(np.uint8)
+    return Image.fromarray(out, mode="RGBA")
+
+
 def _hsb_apply(image: Image.Image, params: dict[str, Any], context: ScriptContext) -> Image.Image:
     own = clamp_count(params.get("count", 1))
     step = (context.variant_index - 1) if own > 1 else 0
@@ -228,6 +304,44 @@ def _built_in_processors() -> list[Processor]:
             Param("noise_alpha", "Noise alpha", "bool", False),
         ],
     )
+    palette = Processor(
+        id="palette",
+        label="Palette noise",
+        blurb="Noise picks one of your colors for each grain, then drifts it within the difference.",
+        apply_fn=_palette_apply,
+        params=[
+            Param(
+                "count",
+                "Count",
+                "int",
+                1,
+                1,
+                MAX_VARIANTS,
+                1,
+                help="How many variants this layer produces. The variant slider and ZIP export use the largest Count in the stack.",
+            ),
+            Param("seed", "Seed", "int", 1, 0, 2_147_483_647, 1, help="Same seed always rebuilds the same pattern."),
+            Param(
+                "colors",
+                "Colors",
+                "colors",
+                "#8a8178 #6e655d #a3988e #554e48",
+                help="The colors noise can choose. Each grain gets one, then a small lighter or darker shift.",
+            ),
+            Param(
+                "spread",
+                "Difference",
+                "int",
+                10,
+                0,
+                64,
+                1,
+                help="How far the chosen color can drift lighter or darker. 0 stays on the exact color.",
+            ),
+            Param("grain_size", "Grain size", "int", 1, 1, 32, 1),
+            Param("preserve_alpha", "Keep transparency", "bool", True),
+        ],
+    )
     hsb = Processor(
         id="hsb",
         label="Adjust color",
@@ -257,7 +371,7 @@ def _built_in_processors() -> list[Processor]:
         label="None",
         blurb="Painted pixels, composited as they are.",
     )
-    return [none, noise, hsb]
+    return [none, noise, palette, hsb]
 
 
 class ScriptLibrary:
@@ -349,6 +463,10 @@ def script_directories() -> list[Path]:
 def processor_from_path(path: Path) -> Processor:
     module = load_module(path)
     if not hasattr(module, "apply"):
+        if hasattr(module, "export") or hasattr(module, "ASSETS"):
+            raise ProcessError(
+                f"{path.name} is a definition. Put it in user_scripts/definitions/, not next to the layer scripts."
+            )
         raise ProcessError(f"{path.name} needs an apply(image, params, context) function.")
     count = getattr(module, "variant_count", None)
     stem = path.stem
@@ -375,8 +493,12 @@ def load_module(path: Path) -> Any:
     return module
 
 
-def params_from_module(module: Any) -> list[Param]:
-    raw = getattr(module, "PARAMS", None) or []
+def parse_params(raw: Any) -> list[Param]:
+    """Read a PARAMS or fields list into the widgets the editor already knows."""
+    if not raw:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise ProcessError("PARAMS has to be a list of objects with a key.")
     params: list[Param] = []
     for item in raw:
         if not isinstance(item, dict) or "key" not in item:
@@ -396,3 +518,7 @@ def params_from_module(module: Any) -> list[Param]:
             )
         )
     return params
+
+
+def params_from_module(module: Any) -> list[Param]:
+    return parse_params(getattr(module, "PARAMS", None) or [])

@@ -21,7 +21,21 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .model import BLOCK_FACE_ORIGIN, TILE, Document, read_ctm, read_face, read_stage
+from .model import (
+    BLOCK_FACE_ORIGIN,
+    TILE,
+    expand_block_sheet,
+    resolve_cube_faces,
+    WOOD_MEMBERS,
+    WOOD_PARTS,
+    BlockTraits,
+    Document,
+    read_ctm,
+    read_face,
+    read_part,
+    read_stage,
+    write_face,
+)
 from .processors import ScriptLibrary
 from .render import render_variant, stack_variant_count
 
@@ -128,24 +142,285 @@ def block_view(yaw: int = 0, pitch: int = 0) -> tuple[str, str, str]:
     return cap, left, right
 
 
-def _face_xyz(name: str, col: int, row: int, last: int) -> tuple[int, int, int]:
-    """Map a texture pixel onto the block.
+def _yaw_xyz(points: np.ndarray, yaw: int, span: float) -> np.ndarray:
+    """Turn world points clockwise about Y, one quarter turn at a time."""
+    out = np.array(points, dtype=np.float32, copy=True)
+    for _ in range(int(yaw) % 4):
+        x = out[:, 0].copy()
+        out[:, 0] = out[:, 2]
+        out[:, 2] = span - x
+    return out
 
-    Column 0 is the left of the face and row 0 is its top, matching the
-    block-game cube: image-right follows the face's right vector, and image-up
-    follows its up vector. On the top face, row 0 is north.
+
+def _project_xyz(
+    points: np.ndarray,
+    pitch: int,
+    scale: float,
+    span: float,
+    margin: float,
+    height: float = 16.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Isometric screen position and a depth that grows toward the camera."""
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    sx = (x - z) * scale + span * scale + margin
+    if int(pitch) % 2:
+        sy = ((x + z) * 0.5 + y) * scale + margin
+    else:
+        sy = ((x + z) * 0.5 + (height - y)) * scale + margin
+    return np.stack((sx, sy), axis=1).astype(np.float32), (x + z).astype(np.float32)
+
+
+def _canvas_size(span: float, scale: float, margin: float, height: float = 16.0) -> tuple[int, int]:
+    width = int(math.ceil(span * 2.0 * scale + margin * 2.0))
+    tall = int(math.ceil((span + height) * scale + margin * 2.0))
+    return max(1, width), max(1, tall)
+
+
+def _uv_at(face: str, x: float, y: float, z: float, bounds: tuple[int, ...], uv: tuple[int, int, int, int]) -> tuple[float, float]:
+    """Texture coordinate of a point on a box face. Row 0 of the texture is the top."""
+    x0, y0, z0, x1, y1, z1 = (float(value) for value in bounds)
+    u0, v0, u1, v1 = (float(value) for value in uv)
+    span_x = max(1e-6, x1 - x0)
+    span_y = max(1e-6, y1 - y0)
+    span_z = max(1e-6, z1 - z0)
+    if face == "south":
+        across = (x - x0) / span_x
+        down = 1.0 - (y - y0) / span_y
+    elif face == "north":
+        across = (x1 - x) / span_x
+        down = 1.0 - (y - y0) / span_y
+    elif face == "east":
+        across = (z1 - z) / span_z
+        down = 1.0 - (y - y0) / span_y
+    elif face == "west":
+        across = (z - z0) / span_z
+        down = 1.0 - (y - y0) / span_y
+    elif face == "top":
+        across = (x - x0) / span_x
+        down = (z - z0) / span_z
+    else:
+        across = (x - x0) / span_x
+        down = (z1 - z) / span_z
+    return u0 + across * (u1 - u0), v0 + down * (v1 - v0)
+
+
+def _face_corners(face: str, a0: float, b0: float, a1: float, b1: float, plane: float) -> list[tuple[float, float, float]]:
+    """Texture-order corners of a rectangle on a face: top-left, top-right, bottom-right, bottom-left."""
+    if face == "south":
+        return [(a0, b1, plane), (a1, b1, plane), (a1, b0, plane), (a0, b0, plane)]
+    if face == "north":
+        return [(a1, b1, plane), (a0, b1, plane), (a0, b0, plane), (a1, b0, plane)]
+    if face == "east":
+        return [(plane, b1, a1), (plane, b1, a0), (plane, b0, a0), (plane, b0, a1)]
+    if face == "west":
+        return [(plane, b1, a0), (plane, b1, a1), (plane, b0, a1), (plane, b0, a0)]
+    if face == "top":
+        return [(a0, plane, b0), (a1, plane, b0), (a1, plane, b1), (a0, plane, b1)]
+    return [(a0, plane, b1), (a1, plane, b1), (a1, plane, b0), (a0, plane, b0)]
+
+
+def _face_plane(face: str, bounds: tuple[int, ...]) -> float:
+    x0, y0, z0, x1, y1, z1 = bounds
+    if face == "south":
+        return float(z1)
+    if face == "north":
+        return float(z0)
+    if face == "east":
+        return float(x1)
+    if face == "west":
+        return float(x0)
+    if face == "top":
+        return float(y1)
+    return float(y0)
+
+
+def _full_rect(face: str, origin: tuple[int, int, int]) -> tuple[int, int, int, int]:
+    ox, oy, oz = origin
+    if face in ("south", "north"):
+        return (ox, oy, ox + TILE, oy + TILE)
+    if face in ("east", "west"):
+        return (oz, oy, oz + TILE, oy + TILE)
+    return (ox, oz, ox + TILE, oz + TILE)
+
+
+def _merge_cells(cells: list[tuple[int, int]]) -> list[tuple[int, int, int, int]]:
+    """Greedy solid rectangles. Each cell covers one world unit."""
+    remaining = set(cells)
+    rects: list[tuple[int, int, int, int]] = []
+    while remaining:
+        a, b = min(remaining)
+        width = 1
+        while (a + width, b) in remaining:
+            width += 1
+        height = 1
+        while all((a + i, b + height) in remaining for i in range(width)):
+            height += 1
+        for i in range(width):
+            for j in range(height):
+                remaining.remove((a + i, b + j))
+        rects.append((a, b, a + width, b + height))
+    return rects
+
+
+def _exposed_rects(face: str, bounds: tuple[int, ...], occupied: set[tuple[int, int, int]]) -> list[tuple[int, int, int, int]]:
+    step = _FACE_STEP[face]
+    cells: list[tuple[int, int]] = []
+    for x, y, z in _face_cells(face, bounds):
+        outward = (x + step[0], y + step[1], z + step[2])
+        if outward in occupied:
+            continue
+        if face in ("south", "north"):
+            cells.append((x, y))
+        elif face in ("east", "west"):
+            cells.append((z, y))
+        else:
+            cells.append((x, z))
+    return _merge_cells(cells)
+
+
+def _rect_quad(
+    face: str,
+    bounds: tuple[int, ...],
+    rect: tuple[int, int, int, int],
+    uv: tuple[int, int, int, int],
+    texture: np.ndarray,
+    shade: float,
+    bias: float,
+    glow: np.ndarray | None,
+    glow_strength: float,
+) -> tuple:
+    a0, b0, a1, b1 = rect
+    corners = _face_corners(face, float(a0), float(b0), float(a1), float(b1), _face_plane(face, bounds))
+    tex_uv = [_uv_at(face, x, y, z, bounds, uv) for x, y, z in corners]
+    return (corners, tex_uv, texture, shade, bias, glow, glow_strength)
+
+
+def _raster_screen(quads: list[tuple], width: int, height: int) -> np.ndarray:
+    """Draw textured quads. Two samples per pixel, then averaged, so edges stay smooth.
+
+    Texture lookup stays on texel boundaries, so the art remains the block's
+    pixels. Only the silhouette is blended.
     """
-    if name == "east":
-        return last, last - row, last - col
-    if name == "west":
-        return 0, last - row, col
-    if name == "south":
-        return col, last - row, last
-    if name == "north":
-        return last - col, last - row, 0
-    if name == "bottom":
-        return col, 0, last - row
-    return col, last, row
+    samples = 2
+    wide, tall = width * samples, height * samples
+    premul = np.zeros((tall, wide, 4), dtype=np.float32)
+    depth_buf = np.full((tall, wide), -1e9, dtype=np.float32)
+    for screen, depth, uvs, texture, shade, bias, glow, glow_strength in quads:
+        projected = np.asarray(screen, dtype=np.float32) * samples
+        center = projected.mean(axis=0)
+        projected = center + (projected - center) * 1.02
+        depths = np.asarray(depth, dtype=np.float32) + float(bias)
+        coords = np.asarray(uvs, dtype=np.float32)
+        _fill_tri_aa(
+            premul, depth_buf, projected[0], projected[1], projected[2],
+            depths[0], depths[1], depths[2], coords[0], coords[1], coords[2],
+            texture, shade, glow, glow_strength,
+        )
+        _fill_tri_aa(
+            premul, depth_buf, projected[0], projected[2], projected[3],
+            depths[0], depths[2], depths[3], coords[0], coords[2], coords[3],
+            texture, shade, glow, glow_strength,
+        )
+    folded = premul.reshape(height, samples, width, samples, 4).mean(axis=(1, 3))
+    alpha = folded[:, :, 3:4]
+    rgb = np.zeros_like(folded[:, :, :3])
+    mask = alpha[:, :, 0] > 0.25
+    rgb[mask] = folded[:, :, :3][mask] / np.maximum(alpha[:, :, 0][mask] / 255.0, 1e-6)[:, None]
+    out = np.zeros((height, width, 4), dtype=np.uint8)
+    out[:, :, :3] = np.clip(np.round(rgb), 0, 255).astype(np.uint8)
+    out[:, :, 3] = np.clip(np.round(alpha[:, :, 0]), 0, 255).astype(np.uint8)
+    return out
+
+
+def _fill_tri_aa(
+    premul: np.ndarray,
+    depth_buf: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+    c: np.ndarray,
+    da: float,
+    db: float,
+    dc: float,
+    uv_a: np.ndarray,
+    uv_b: np.ndarray,
+    uv_c: np.ndarray,
+    texture: np.ndarray,
+    shade: float,
+    glow: np.ndarray | None,
+    glow_strength: float,
+) -> None:
+    height, width = premul.shape[:2]
+    points = np.stack((a, b, c))
+    min_x = max(int(np.floor(points[:, 0].min())), 0)
+    max_x = min(int(np.ceil(points[:, 0].max())), width - 1)
+    min_y = max(int(np.floor(points[:, 1].min())), 0)
+    max_y = min(int(np.ceil(points[:, 1].max())), height - 1)
+    if min_x > max_x or min_y > max_y:
+        return
+    xs = np.arange(min_x, max_x + 1, dtype=np.float32) + 0.5
+    ys = np.arange(min_y, max_y + 1, dtype=np.float32) + 0.5
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    v0x, v0y = float(c[0] - a[0]), float(c[1] - a[1])
+    v1x, v1y = float(b[0] - a[0]), float(b[1] - a[1])
+    v2x = grid_x - float(a[0])
+    v2y = grid_y - float(a[1])
+    dot00 = v0x * v0x + v0y * v0y
+    dot01 = v0x * v1x + v0y * v1y
+    dot11 = v1x * v1x + v1y * v1y
+    denom = dot00 * dot11 - dot01 * dot01
+    if abs(denom) < 1e-8:
+        return
+    inv = 1.0 / denom
+    dot02 = v0x * v2x + v0y * v2y
+    dot12 = v1x * v2x + v1y * v2y
+    u = (dot11 * dot02 - dot01 * dot12) * inv
+    v = (dot00 * dot12 - dot01 * dot02) * inv
+    mask = (u >= -1e-4) & (v >= -1e-4) & (u + v <= 1.0 + 1e-4)
+    if not np.any(mask):
+        return
+    d = float(da) + (float(dc) - float(da)) * u + (float(db) - float(da)) * v
+    patch_depth = depth_buf[min_y : max_y + 1, min_x : max_x + 1]
+    closer = mask & (d >= patch_depth - 1e-4)
+    if not np.any(closer):
+        return
+    tex_h, tex_w = texture.shape[:2]
+    uu = float(uv_a[0]) + (float(uv_c[0]) - float(uv_a[0])) * u + (float(uv_b[0]) - float(uv_a[0])) * v
+    vv = float(uv_a[1]) + (float(uv_c[1]) - float(uv_a[1])) * u + (float(uv_b[1]) - float(uv_a[1])) * v
+    tx = np.clip(np.floor(uu).astype(np.int32), 0, tex_w - 1)
+    ty = np.clip(np.floor(vv).astype(np.int32), 0, tex_h - 1)
+    samples = texture[ty, tx].astype(np.float32)
+    if glow is not None and glow_strength > 0:
+        gh, gw = glow.shape[:2]
+        gx = np.clip(np.floor(uu).astype(np.int32), 0, gw - 1)
+        gy = np.clip(np.floor(vv).astype(np.int32), 0, gh - 1)
+        add = glow[gy, gx].astype(np.float32)
+        samples[:, :, :3] = samples[:, :, :3] * shade + add[:, :, :3] * (add[:, :, 3:4] / 255.0) * float(glow_strength)
+        samples[:, :, 3] = np.maximum(samples[:, :, 3], add[:, :, 3])
+    else:
+        samples[:, :, :3] *= shade
+    write = closer & (samples[:, :, 3] > 0)
+    if not np.any(write):
+        return
+    alpha = samples[:, :, 3:4] / 255.0
+    color = np.empty_like(samples)
+    color[:, :, :3] = samples[:, :, :3] * alpha[:, :, 0:1]
+    color[:, :, 3] = samples[:, :, 3]
+    patch = premul[min_y : max_y + 1, min_x : max_x + 1]
+    patch[write] = color[write]
+    patch_depth[write] = d[write]
+
+
+def _render_world(quads: list[tuple], *, yaw: int, pitch: int, scale: int, span: float) -> np.ndarray:
+    margin = 2.0
+    pixels = max(1, int(scale))
+    width, height = _canvas_size(span, pixels, margin)
+    screen_quads = []
+    for corners, uvs, texture, shade, bias, glow, glow_strength in quads:
+        turned = _yaw_xyz(np.asarray(corners, dtype=np.float32), yaw, span)
+        screen, depth = _project_xyz(turned, pitch, pixels, span, margin)
+        screen_quads.append((screen, depth, uvs, texture, shade, bias, glow, glow_strength))
+    image = _raster_screen(screen_quads, width, height)
+    return on_checker(image, cell=max(4, pixels * 2))
 
 
 def cube_preview(
@@ -174,43 +449,16 @@ def cube_preview(
         "north": _square(side if north is None else north),
         "west": _square(side if west is None else west),
     }
-    n = int(tiles["top"].shape[0])
-    last = n - 1
-    cap, left_name, right_name = block_view(yaw, pitch)
-    shades = {cap: 1.0 if cap == "top" else 0.62, left_name: 0.92, right_name: 0.72}
-    canvas = np.zeros((2 * n, 2 * n, 4), dtype=np.uint8)
-    depth = np.full(canvas.shape[:2], -1, dtype=np.int16)
-    for name in (right_name, left_name, cap):
-        tile = _fit_tile(tiles[name], n)
-        factor = shades[name]
-        for row in range(n):
-            for col in range(n):
-                color = tile[row, col]
-                if int(color[3]) == 0:
-                    continue
-                x, y, z = _face_xyz(name, col, row, last)
-                x, z = _turn_xz(x, z, yaw, last)
-                sx = (x - z) + n
-                # From above, world-up points up the image. From below, the
-                # underside is the cap and the sides hang beneath it.
-                if int(pitch) % 2:
-                    sy = (x + z) // 2 + y
-                else:
-                    sy = (x + z) // 2 + (last - y)
-                if not (0 <= sy < canvas.shape[0] and 0 <= sx < canvas.shape[1]):
-                    continue
-                near = (x + z) * 2 + (n if name == cap else 0)
-                if near < int(depth[sy, sx]):
-                    continue
-                depth[sy, sx] = near
-                if factor == 1.0:
-                    canvas[sy, sx] = color
-                else:
-                    rgb = np.clip(np.round(color[:3].astype(np.float32) * factor), 0, 255)
-                    canvas[sy, sx, :3] = rgb.astype(np.uint8)
-                    canvas[sy, sx, 3] = color[3]
-    preview = np.repeat(np.repeat(canvas, max(1, int(scale)), axis=0), max(1, int(scale)), axis=1)
-    return on_checker(preview, cell=max(4, max(1, int(scale)) * 2))
+    box = (0, 0, 0, TILE, TILE, TILE, {name: (0, 0, TILE, TILE) for name in tiles})
+    return _shape_preview(
+        tiles,
+        (box,),
+        yaw=yaw,
+        pitch=pitch,
+        glow=None,
+        glow_strength=0.0,
+        scale=max(1, int(scale)),
+    )
 
 
 # Connection bits follow the face, matching block-game: up=1, down=2, left=4, right=8.
@@ -266,22 +514,6 @@ def _color_tile(color: str) -> np.ndarray:
         return np.zeros((TILE, TILE, 4), dtype=np.uint8)
     tile[..., 3] = 255
     return tile
-
-
-def _with_glow(tile: np.ndarray, glow: np.ndarray | None, strength: float, shade: float) -> np.ndarray:
-    """Shade the face, then add the fluorescence on top so it still reads as light."""
-    base = np.array(tile, dtype=np.float32, copy=True)
-    if shade != 1.0:
-        base[..., :3] *= float(shade)
-    if glow is not None and strength > 0:
-        add = np.asarray(glow, dtype=np.float32)
-        if add.shape[0] != base.shape[0] or add.shape[1] != base.shape[1]:
-            add = add[: base.shape[0], : base.shape[1]]
-        add_rgb = add[..., :3] * (add[..., 3:4] / 255.0) * float(strength)
-        base[..., :3] += add_rgb
-        base[..., 3] = np.maximum(base[..., 3], add[..., 3])
-    out = np.clip(np.round(base), 0, 255).astype(np.uint8)
-    return out
 
 
 # Boxes are the block-game model elements, in the 0–16 grid. UVs match those
@@ -374,40 +606,6 @@ _FACE_STEP = {
 }
 
 
-def _texel(tile: np.ndarray, u: float, v: float) -> np.ndarray:
-    height, width = tile.shape[:2]
-    col = min(width - 1, max(0, int(u)))
-    row = min(height - 1, max(0, int(v)))
-    return tile[row, col]
-
-
-def _box_uv(face: str, x: int, y: int, z: int, bounds: tuple[int, ...], uv: tuple[int, int, int, int]) -> tuple[float, float]:
-    x0, y0, z0, x1, y1, z1 = bounds
-    u0, v0, u1, v1 = uv
-    span_x = max(1, x1 - x0)
-    span_y = max(1, y1 - y0)
-    span_z = max(1, z1 - z0)
-    if face == "south":
-        across = (x + 0.5 - x0) / span_x
-        down = 1.0 - (y + 0.5 - y0) / span_y
-    elif face == "north":
-        across = (x1 - (x + 0.5)) / span_x
-        down = 1.0 - (y + 0.5 - y0) / span_y
-    elif face == "east":
-        across = (z1 - (z + 0.5)) / span_z
-        down = 1.0 - (y + 0.5 - y0) / span_y
-    elif face == "west":
-        across = (z + 0.5 - z0) / span_z
-        down = 1.0 - (y + 0.5 - y0) / span_y
-    elif face == "top":
-        across = (x + 0.5 - x0) / span_x
-        down = (z + 0.5 - z0) / span_z
-    else:
-        across = (x + 0.5 - x0) / span_x
-        down = (z1 - (z + 0.5)) / span_z
-    return u0 + across * (u1 - u0), v0 + down * (v1 - v0)
-
-
 def _face_cells(face: str, bounds: tuple[int, ...]):
     x0, y0, z0, x1, y1, z1 = bounds
     if face == "south":
@@ -452,11 +650,12 @@ def _shape_preview(
     glow_strength: float,
     scale: int,
 ) -> np.ndarray:
-    """Draw one block made of the model's boxes, from the same camera as a cube."""
-    n = TILE
-    last = n - 1
+    """Draw one block made of the model's boxes, from the same camera as a cube.
+
+    Each visible face is one quad (or a few, where a neighbor covers part of
+    it), so the outline is the block's edge instead of a staircase of texels.
+    """
     cap, left_name, right_name = block_view(yaw, pitch)
-    visible = {cap, left_name, right_name}
     shades = {cap: 1.0 if cap == "top" else 0.62, left_name: 0.92, right_name: 0.72}
     occupied: set[tuple[int, int, int]] = set()
     for box in boxes:
@@ -465,47 +664,20 @@ def _shape_preview(
             for y in range(y0, y1):
                 for z in range(z0, z1):
                     occupied.add((x, y, z))
-    canvas = np.zeros((n * 2, n * 2, 4), dtype=np.uint8)
-    depth = np.full(canvas.shape[:2], -1, dtype=np.int16)
-    below = int(pitch) % 2 == 1
+    quads = []
     for box in boxes:
         bounds = box[:6]
         uvs = box[6]
         for name in (right_name, left_name, cap):
-            if name not in uvs or name not in visible:
+            if name not in uvs:
                 continue
-            step = _FACE_STEP[name]
             shade = shades[name]
-            for x, y, z in _face_cells(name, bounds):
-                outward = (x + step[0], y + step[1], z + step[2])
-                if outward in occupied:
-                    continue
-                u, v = _box_uv(name, x, y, z, bounds, uvs[name])
-                sample = _texel(faces[name], u, v).astype(np.float32)
-                if shade != 1.0:
-                    sample[:3] *= shade
-                if glow is not None and glow_strength > 0:
-                    add = _texel(glow, u, v).astype(np.float32)
-                    sample[:3] += add[:3] * (add[3] / 255.0) * float(glow_strength)
-                    sample[3] = max(float(sample[3]), float(add[3]))
-                if sample[3] <= 0:
-                    continue
-                color = np.clip(np.round(sample), 0, 255).astype(np.uint8)
-                turned_x, turned_z = _turn_xz(x, z, yaw, last)
-                sx = (turned_x - turned_z) + n
-                if below:
-                    sy = (turned_x + turned_z) // 2 + y
-                else:
-                    sy = (turned_x + turned_z) // 2 + (last - y)
-                if not (0 <= sy < canvas.shape[0] and 0 <= sx < canvas.shape[1]):
-                    continue
-                near = (turned_x + turned_z) * 2 + (n if name == cap else 0)
-                if near < int(depth[sy, sx]):
-                    continue
-                depth[sy, sx] = near
-                canvas[sy, sx] = color
-    preview = np.repeat(np.repeat(canvas, max(1, int(scale)), axis=0), max(1, int(scale)), axis=1)
-    return on_checker(preview, cell=max(4, max(1, int(scale)) * 2))
+            bias = 8.0 if name == cap else 0.0
+            for rect in _exposed_rects(name, bounds, occupied):
+                quads.append(
+                    _rect_quad(name, bounds, rect, uvs[name], faces[name], shade, bias, glow, glow_strength)
+                )
+    return _render_world(quads, yaw=yaw, pitch=pitch, scale=max(1, int(scale)), span=float(TILE))
 
 
 def _plant_tile(faces: dict[str, np.ndarray]) -> np.ndarray:
@@ -532,75 +704,38 @@ def _cross_preview(
     Texture row 0 is the top of the plant. One plane runs northwest to
     southeast, the other northeast to southwest.
     """
+    pixels = max(1, int(scale))
     angle = int(yaw) * math.pi / 2.0 + math.radians(22)
     cos_a = math.cos(angle)
     sin_a = math.sin(angle)
     below = int(pitch) % 2 == 1
-    canvas = np.zeros((48, 48, 4), dtype=np.uint8)
-    depth = np.full(canvas.shape[:2], -1e9, dtype=np.float32)
 
     def project(x: float, y: float, z: float) -> tuple[float, float, float]:
-        rx = (x - 7.5) * cos_a - (z - 7.5) * sin_a
-        rz = (x - 7.5) * sin_a + (z - 7.5) * cos_a
-        sx = (rx - rz) + 24.0
+        rx = (x - 8.0) * cos_a - (z - 8.0) * sin_a
+        rz = (x - 8.0) * sin_a + (z - 8.0) * cos_a
+        sx = (rx - rz) * pixels + 24.0 * pixels
         if below:
-            sy = (rx + rz) * 0.5 + y + 8.0
+            sy = ((rx + rz) * 0.5 + y) * pixels + 8.0 * pixels
         else:
-            sy = (rx + rz) * 0.5 + ((TILE - 1) - y) + 8.0
+            sy = ((rx + rz) * 0.5 + (16.0 - y)) * pixels + 8.0 * pixels
         return sx, sy, rx + rz
 
-    def paint(sx: int, sy: int, near: float, color: np.ndarray) -> None:
-        if not (0 <= sy < canvas.shape[0] and 0 <= sx < canvas.shape[1]):
-            return
-        if near < float(depth[sy, sx]):
-            return
-        depth[sy, sx] = near
-        canvas[sy, sx] = color
-
-    shades = (0.82, 1.0)
-    for plane in (0, 1):
-        shade = shades[plane]
-        for row in range(TILE):
-            for col in range(TILE):
-                sample = tile[row, col].astype(np.float32)
-                if shade != 1.0:
-                    sample[:3] *= shade
-                if glow is not None and glow_strength > 0:
-                    add = _texel(glow, col, row).astype(np.float32)
-                    sample[:3] += add[:3] * (add[3] / 255.0) * float(glow_strength)
-                    sample[3] = max(float(sample[3]), float(add[3]))
-                if sample[3] <= 0:
-                    continue
-                color = np.clip(np.round(sample), 0, 255).astype(np.uint8)
-                y0 = float((TILE - 1) - row)
-                y1 = y0 - 1.0
-                if plane == 0:
-                    corners = ((col, y0, col), (col + 1, y0, col + 1), (col + 1, y1, col + 1), (col, y1, col))
-                else:
-                    z0 = (TILE - 1) - col
-                    corners = (
-                        (col, y0, z0),
-                        (col + 1, y0, z0 - 1),
-                        (col + 1, y1, z0 - 1),
-                        (col, y1, z0),
-                    )
-                projected = [project(x, y, z) for x, y, z in corners]
-                xs = [point[0] for point in projected]
-                ys = [point[1] for point in projected]
-                near = max(point[2] for point in projected) + plane * 0.01
-                min_x = max(0, int(math.floor(min(xs))))
-                max_x = min(canvas.shape[1] - 1, int(math.ceil(max(xs))))
-                min_y = max(0, int(math.floor(min(ys))))
-                max_y = min(canvas.shape[0] - 1, int(math.ceil(max(ys))))
-                if max_x < min_x or max_y < min_y:
-                    sx, sy, _near = projected[0]
-                    paint(int(round(sx)), int(round(sy)), near, color)
-                    continue
-                for sy in range(min_y, max_y + 1):
-                    for sx in range(min_x, max_x + 1):
-                        paint(sx, sy, near, color)
-    preview = np.repeat(np.repeat(canvas, max(1, int(scale)), axis=0), max(1, int(scale)), axis=1)
-    return on_checker(preview, cell=max(4, max(1, int(scale)) * 2))
+    planes = (
+        (((0.0, 16.0, 0.0), (16.0, 16.0, 16.0), (16.0, 0.0, 16.0), (0.0, 0.0, 0.0)), 0.82),
+        (((0.0, 16.0, 16.0), (16.0, 16.0, 0.0), (16.0, 0.0, 0.0), (0.0, 0.0, 16.0)), 1.0),
+    )
+    uvs = ((0.0, 0.0), (16.0, 0.0), (16.0, 16.0), (0.0, 16.0))
+    quads = []
+    for index, (corners, shade) in enumerate(planes):
+        screen = []
+        depth = []
+        for x, y, z in corners:
+            sx, sy, near = project(x, y, z)
+            screen.append((sx, sy))
+            depth.append(near + index * 0.01)
+        quads.append((screen, depth, uvs, tile, shade, 0.0, glow, glow_strength))
+    image = _raster_screen(quads, 48 * pixels, 48 * pixels)
+    return on_checker(image, cell=max(4, pixels * 2))
 
 
 def block_preview(
@@ -614,6 +749,7 @@ def block_preview(
     glow_strength: float = 0.0,
     scale: int | None = None,
     shape: str = "cube",
+    faces: str = "six",
 ) -> np.ndarray:
     """The block as it sits in the world.
 
@@ -622,15 +758,15 @@ def block_preview(
     walls draw that model's boxes. Fluorescence is added at full ultraviolet,
     scaled by strength. A flat glow color fills every face.
     """
-    array = np.asarray(image, dtype=np.uint8)
-    faces = {name: read_face(array, name) for name in BLOCK_FACE_ORIGIN}
+    array = expand_block_sheet(np.asarray(image, dtype=np.uint8), faces)
+    cube_faces = {name: read_face(array, name) for name in BLOCK_FACE_ORIGIN}
     if glow is None and glow_color and glow_strength > 0:
         glow = _color_tile(glow_color)
     glow_tile = None if glow is None or glow_strength <= 0 else _fit_tile(np.asarray(glow, dtype=np.uint8), TILE)
     if shape == "cross":
-        chosen = 4 if scale is None else max(1, int(scale))
+        chosen = 6 if scale is None else max(1, int(scale))
         return _cross_preview(
-            _plant_tile(faces),
+            _plant_tile(cube_faces),
             yaw=yaw,
             pitch=pitch,
             glow=glow_tile,
@@ -638,9 +774,9 @@ def block_preview(
             scale=chosen,
         )
     if shape in _SHAPE_BOXES:
-        chosen = 4 if scale is None else max(1, int(scale))
+        chosen = 6 if scale is None else max(1, int(scale))
         return _shape_preview(
-            faces,
+            cube_faces,
             _SHAPE_BOXES[shape],
             yaw=yaw,
             pitch=pitch,
@@ -650,54 +786,33 @@ def block_preview(
         )
     use_ctm = ctm is not None
     cells = set(_CLUSTER) if use_ctm else {(0, 0, 0)}
-    span = 2 if use_ctm else 1
-    n = TILE
-    last = n - 1
-    horizontal = span * n - 1
+    span_blocks = 2 if use_ctm else 1
+    chosen = (3 if use_ctm else 6) if scale is None else max(1, int(scale))
     cap, left_name, right_name = block_view(yaw, pitch)
     shades = {cap: 1.0 if cap == "top" else 0.62, left_name: 0.92, right_name: 0.72}
-    width = span * n * 2
-    height = span * n + n
-    canvas = np.zeros((height, width, 4), dtype=np.uint8)
-    depth = np.full(canvas.shape[:2], -1, dtype=np.int16)
-    below = int(pitch) % 2 == 1
+    full_uv = (0, 0, TILE, TILE)
+    quads = []
     for pos in cells:
+        origin = (pos[0] * TILE, 0, pos[2] * TILE)
+        bounds = (origin[0], origin[1], origin[2], origin[0] + TILE, origin[1] + TILE, origin[2] + TILE)
         for name in (right_name, left_name, cap):
             if _face_hidden(cells, pos, name):
                 continue
-            if use_ctm:
-                tile = read_ctm(np.asarray(ctm), _connection_mask(cells, pos, name))
-            else:
-                tile = faces[name]
-            painted = _with_glow(tile, glow_tile, glow_strength, shades[name])
-            bx, _by, bz = pos
-            for row in range(n):
-                for col in range(n):
-                    color = painted[row, col]
-                    if int(color[3]) == 0:
-                        continue
-                    local_x, local_y, local_z = _face_xyz(name, col, row, last)
-                    x = local_x + bx * n
-                    z = local_z + bz * n
-                    y = local_y
-                    x, z = _turn_xz(x, z, yaw, horizontal)
-                    sx = (x - z) + span * n
-                    if below:
-                        sy = (x + z) // 2 + y
-                    else:
-                        sy = (x + z) // 2 + (last - y)
-                    if not (0 <= sy < canvas.shape[0] and 0 <= sx < canvas.shape[1]):
-                        continue
-                    near = (x + z) * 2 + (n if name == cap else 0)
-                    if near < int(depth[sy, sx]):
-                        continue
-                    depth[sy, sx] = near
-                    canvas[sy, sx] = color
-    chosen = 2 if use_ctm else 4
-    if scale is not None:
-        chosen = max(1, int(scale))
-    preview = np.repeat(np.repeat(canvas, chosen, axis=0), chosen, axis=1)
-    return on_checker(preview, cell=max(4, chosen * 2))
+            tile = read_ctm(np.asarray(ctm), _connection_mask(cells, pos, name)) if use_ctm else cube_faces[name]
+            quads.append(
+                _rect_quad(
+                    name,
+                    bounds,
+                    _full_rect(name, origin),
+                    full_uv,
+                    tile,
+                    shades[name],
+                    8.0 if name == cap else 0.0,
+                    glow_tile,
+                    glow_strength,
+                )
+            )
+    return _render_world(quads, yaw=yaw, pitch=pitch, scale=chosen, span=float(TILE * span_blocks))
 
 
 def sprite_preview(image: np.ndarray, pixels: int = 96) -> np.ndarray:
@@ -744,12 +859,17 @@ def _crop_package(
         "water_vertical": int(crop.water_vertical),
         "seeds": seeds,
         "produce": produce,
-        "food": int(crop.food),
+        "loot_table": f"crops/{asset_id}_ripe",
         "ground": crop.ground.split(),
         "seed_tab": crop.seed_tab,
         "produce_tab": crop.produce_tab,
     }
-    extra: dict[str, dict] = {}
+    extra: dict[str, dict] = {
+        f"loot/crops/{asset_id}_ripe.json": _loot_table(_ripe_entries(crop, produce, seeds)),
+        f"loot/crops/{asset_id}_young.json": _loot_table(
+            [{"type": "item", "name": seeds, "count": 1}]
+        ),
+    }
     taken = {f"{asset_id}.json"}
     seed_name = f"{seeds}.json"
     if seed_name in taken:
@@ -778,10 +898,172 @@ def _crop_package(
             "texture": produce,
             "max_stack": 64,
             "left": "none",
-            "right": "eat",
-            "food": int(crop.food),
+            "right": "none",
+            "food": 0,
         }
     return payload, files, extra
+
+
+def _ripe_entries(crop, produce: str, seeds: str) -> list[dict]:
+    """Loot rows for a ripe plant. A blank item follows the produce, then the seeds."""
+    entries: list[dict] = []
+    for index, drop in enumerate(crop.loot):
+        item = drop.item or (produce if index == 0 else seeds if index == 1 else "")
+        if not item:
+            continue
+        entry: dict = {"type": "item", "name": item}
+        if int(drop.minimum) == int(drop.maximum):
+            entry["count"] = int(drop.minimum)
+        else:
+            entry["count"] = [int(drop.minimum), int(drop.maximum)]
+        if float(drop.chance) < 1.0:
+            entry["chance"] = float(drop.chance)
+        entries.append(entry)
+    return entries
+
+
+def _loot_table(entries: list[dict]) -> dict:
+    return {"type": "block", "pools": [{"rolls": 1, "entries": entries}]}
+
+
+def _opening_package(
+    kind: str,
+    asset_id: str,
+    image: np.ndarray,
+    doc: Document,
+) -> tuple[dict, dict[str, np.ndarray], dict[str, dict]]:
+    """A door or trapdoor block, its behavior file, the placeable item, and loot.
+
+    A door paints lower, upper, and edge. A trapdoor paints the panel and the edge.
+    The item icon is the panel, or the upper half stacked on the lower half.
+    """
+    traits = doc.traits
+    door = kind == "door"
+    if door:
+        lower = read_part(image, 0)
+        upper = read_part(image, 1)
+        edge = read_part(image, 2)
+        tiles = (("lower", lower), ("upper", upper), ("edge", edge))
+        icon = _half_stack(upper, lower)
+    else:
+        panel = read_part(image, 0)
+        edge = read_part(image, 1)
+        tiles = (("texture", panel), ("edge", edge))
+        icon = panel
+    files: dict[str, np.ndarray] = {}
+    textures = {key: _store_tile(files, f"{asset_id}_{key}", tile) for key, tile in tiles}
+    icon_name = _store_tile(files, asset_id, icon)
+    folder = "doors" if door else "trapdoors"
+    block = {
+        "id": asset_id,
+        "lang": f"block.{asset_id}",
+        "tab": traits.tab or "building",
+        "model": "door_lower" if door else "trapdoor",
+        "type": "door" if door else "trapdoor",
+        "render": traits.render if traits.render != "solid" else "cutout",
+        "solid": bool(traits.solid),
+        "hardness": traits.hardness,
+        "tool": traits.tool,
+        "mining_level": int(traits.mining_level),
+        "sound": traits.sound,
+        "loot_table": f"blocks/{asset_id}",
+        "properties": (
+            {"door": True, "half": "lower", "facing": "south", "open": False}
+            if door
+            else {"trapdoor": True, "half": "bottom", "facing": "north", "open": False}
+        ),
+        "textures": textures,
+    }
+    behavior = {
+        "id": asset_id,
+        "sound": traits.sound,
+        "hardness": traits.hardness,
+        "tool": traits.tool,
+        "openable_by_hand": True,
+        "item": asset_id,
+        "loot_table": f"blocks/{asset_id}",
+        "textures": textures,
+    }
+    item = {
+        "id": asset_id,
+        "lang": f"item.{asset_id}",
+        "tab": traits.tab or "building",
+        "model": "flat",
+        "texture": icon_name,
+        "block": asset_id,
+        "max_stack": 64,
+        "left": "break",
+        "right": "place",
+        "durability": 0,
+    }
+    loot = _loot_table([{"type": "item", "name": asset_id, "count": 1}])
+    extra = {
+        f"{folder}/{asset_id}.json": behavior,
+        f"items/{asset_id}.json": item,
+        f"loot/blocks/{asset_id}.json": loot,
+    }
+    return block, files, extra
+
+
+def _half_stack(upper: np.ndarray, lower: np.ndarray) -> np.ndarray:
+    """Squeeze the upper and lower door tiles into one 16×16 item icon."""
+    icon = np.zeros((TILE, TILE, 4), dtype=np.uint8)
+    icon[:8] = upper[::2]
+    icon[8:] = lower[::2]
+    return icon
+
+
+def opening_preview(
+    image: np.ndarray,
+    kind: str,
+    *,
+    yaw: int = 0,
+    pitch: int = 0,
+    scale: int | None = None,
+) -> np.ndarray:
+    """A closed door or trapdoor from the same camera as a cube."""
+    if kind == "door":
+        face = _half_stack(read_part(image, 1), read_part(image, 0))
+        edge = read_part(image, 2)
+        faces = {name: edge for name in BLOCK_FACE_ORIGIN}
+        faces["south"] = face
+        faces["north"] = face
+        boxes = (
+            (0, 0, 13, 16, 16, 16, {
+                "south": _FULL,
+                "north": _FULL,
+                "east": (0, 0, 3, 16),
+                "west": (13, 0, 16, 16),
+                "top": (0, 0, 16, 3),
+                "bottom": (0, 0, 16, 3),
+            }),
+        )
+    else:
+        panel = read_part(image, 0)
+        edge = read_part(image, 1)
+        faces = {name: edge for name in BLOCK_FACE_ORIGIN}
+        faces["top"] = panel
+        faces["bottom"] = panel
+        boxes = (
+            (0, 0, 0, 16, 3, 16, {
+                "north": (0, 0, 16, 3),
+                "south": (0, 0, 16, 3),
+                "east": (0, 0, 16, 3),
+                "west": (0, 0, 16, 3),
+                "top": _FULL,
+                "bottom": _FULL,
+            }),
+        )
+    chosen = 6 if scale is None else max(1, int(scale))
+    return _shape_preview(
+        faces,
+        boxes,
+        yaw=yaw,
+        pitch=pitch,
+        glow=None,
+        glow_strength=0.0,
+        scale=chosen,
+    )
 
 
 def _json_number(value: float) -> int | float:
@@ -789,6 +1071,315 @@ def _json_number(value: float) -> int | float:
     if number == int(number):
         return int(number)
     return number
+
+
+def wood_member_id(prefix: str, member: str) -> str:
+    """Block or item id for one piece of a wood set."""
+    if member.startswith("vertical_planks"):
+        rest = member.removeprefix("vertical_")
+        return f"vertical_{prefix}_{rest}"
+    return f"{prefix}_{member}"
+
+
+def _wood_tiles(image: np.ndarray) -> dict[str, np.ndarray]:
+    return {key: read_part(image, index) for index, (key, _label, _caption) in enumerate(WOOD_PARTS)}
+
+
+def _uniform_faces(tile: np.ndarray) -> dict[str, np.ndarray]:
+    return {name: tile for name in BLOCK_FACE_ORIGIN}
+
+
+def _vertical_planks(tile: np.ndarray) -> np.ndarray:
+    """Turn planks the way block-game turns pine planks into vertical planks."""
+    return np.ascontiguousarray(np.rot90(np.asarray(tile, dtype=np.uint8), 1))
+
+
+def _wood_faces(tiles: dict[str, np.ndarray], member: str) -> dict[str, np.ndarray]:
+    if member == "log":
+        faces = _uniform_faces(tiles["log_side"])
+        faces["top"] = tiles["log_top"]
+        faces["bottom"] = tiles["log_top"]
+        return faces
+    if member == "wood":
+        return _uniform_faces(tiles["log_side"])
+    if member.startswith("vertical_planks"):
+        return _uniform_faces(_vertical_planks(tiles["planks"]))
+    if member == "crafting_table":
+        faces = _uniform_faces(tiles["table_side"])
+        faces["top"] = tiles["table_top"]
+        faces["bottom"] = tiles["log_top"]
+        faces["north"] = tiles["table_front"]
+        faces["south"] = tiles["table_front"]
+        return faces
+    return _uniform_faces(tiles["planks"])
+
+
+def _faces_sheet(faces: dict[str, np.ndarray]) -> np.ndarray:
+    sheet = np.zeros((TILE * 3, TILE * 4, 4), dtype=np.uint8)
+    for name, tile in faces.items():
+        write_face(sheet, name, tile)
+    return sheet
+
+
+def _part_strip(parts: tuple[np.ndarray, ...]) -> np.ndarray:
+    image = np.zeros((TILE, TILE * len(parts), 4), dtype=np.uint8)
+    for index, tile in enumerate(parts):
+        image[:, index * TILE : (index + 1) * TILE] = tile
+    return image
+
+
+_WOOD_SHAPES = {
+    "log": "cube",
+    "wood": "cube",
+    "planks": "cube",
+    "planks_slab": "slab",
+    "planks_vertical_slab": "vertical_slab",
+    "planks_stairs": "stairs",
+    "vertical_planks": "cube",
+    "vertical_planks_slab": "slab",
+    "vertical_planks_vertical_slab": "vertical_slab",
+    "vertical_planks_stairs": "stairs",
+    "crafting_table": "cube",
+}
+
+
+def wood_preview(
+    image: np.ndarray,
+    member: str = "log",
+    *,
+    yaw: int = 0,
+    pitch: int = 0,
+    scale: int | None = None,
+) -> np.ndarray:
+    """One wood-set piece, from the same camera as a single block."""
+    tiles = _wood_tiles(image)
+    key = member if member in _WOOD_SHAPES or member in ("stick", "door", "trapdoor") else "log"
+    if key == "stick":
+        return sprite_preview(tiles["stick"])
+    if key == "door":
+        strip = _part_strip((tiles["door_lower"], tiles["door_upper"], tiles["door_edge"]))
+        return opening_preview(strip, "door", yaw=yaw, pitch=pitch, scale=scale)
+    if key == "trapdoor":
+        strip = _part_strip((tiles["trapdoor"], tiles["door_edge"]))
+        return opening_preview(strip, "trapdoor", yaw=yaw, pitch=pitch, scale=scale)
+    return block_preview(
+        _faces_sheet(_wood_faces(tiles, key)),
+        yaw=yaw,
+        pitch=pitch,
+        scale=scale,
+        shape=_WOOD_SHAPES[key],
+    )
+
+
+def _wood_block(
+    asset_id: str,
+    shape: str,
+    textures: dict[str, str],
+    hardness: float,
+    *,
+    tab: str | list[str] = "building",
+    rotation: str = "",
+    station: str = "",
+    full_block: str = "",
+) -> dict:
+    model_name, block_type = _SHAPE_EXPORT[shape]
+    block = {
+        "id": asset_id,
+        "lang": f"block.{asset_id}",
+        "tab": tab,
+        "model": model_name,
+        "hardness": _json_number(hardness),
+        "tool": "axe",
+        "mining_level": 0,
+        "sound": "wood",
+        "loot_table": f"blocks/{asset_id}",
+        "textures": textures,
+    }
+    if block_type:
+        block["type"] = block_type
+    if full_block:
+        block["full_block"] = full_block
+    if rotation:
+        block["properties"] = {"rotation": rotation}
+    if station:
+        block["station"] = station
+    return block
+
+
+def _place_item(asset_id: str, tab: str | list[str]) -> dict:
+    return {
+        "id": asset_id,
+        "lang": f"item.{asset_id}",
+        "tab": tab,
+        "model": "block",
+        "block": asset_id,
+        "max_stack": 64,
+        "left": "break",
+        "right": "place",
+        "durability": 0,
+        "mining_level": 0,
+        "mining_speed": 1,
+        "attack": 1,
+        "food": 0,
+    }
+
+
+def _absorb_package(
+    files: dict[str, np.ndarray],
+    incoming: dict[str, np.ndarray],
+    block: dict,
+    extra: dict[str, dict],
+) -> None:
+    """Copy a door or trapdoor package in, sharing any texture already stored."""
+    mapping = {name: _store_tile(files, name, tile) for name, tile in incoming.items()}
+
+    def remap(body: dict) -> None:
+        if isinstance(body.get("textures"), dict):
+            body["textures"] = {key: mapping.get(value, value) for key, value in body["textures"].items()}
+        if body.get("texture") in mapping:
+            body["texture"] = mapping[body["texture"]]
+
+    remap(block)
+    for body in extra.values():
+        remap(body)
+
+
+def _wood_package(
+    prefix: str,
+    image: np.ndarray,
+) -> tuple[dict, dict[str, np.ndarray], dict[str, dict]]:
+    """Every block and item a wood set exports, plus the textures they share."""
+    tiles = _wood_tiles(image)
+    files: dict[str, np.ndarray] = {}
+
+    def keep(name: str, tile: np.ndarray) -> str:
+        return _store_tile(files, name, np.ascontiguousarray(tile, dtype=np.uint8))
+
+    log_top = keep(f"{prefix}_log_top", tiles["log_top"])
+    log_side = keep(f"{prefix}_log_side", tiles["log_side"])
+    planks = keep(f"{prefix}_planks", tiles["planks"])
+    vertical = keep(f"vertical_{prefix}_planks", _vertical_planks(tiles["planks"]))
+    stick = keep(f"{prefix}_stick", tiles["stick"])
+    table_top = keep(f"{prefix}_crafting_table_top", tiles["table_top"])
+    table_front = keep(f"{prefix}_crafting_table_front", tiles["table_front"])
+    table_side = keep(f"{prefix}_crafting_table_side", tiles["table_side"])
+    both = ["building", "natural"]
+    pieces: list[tuple[str, dict]] = [
+        (wood_member_id(prefix, "log"), _wood_block(
+            wood_member_id(prefix, "log"), "cube",
+            {"top": log_top, "side": log_side, "bottom": log_top},
+            2.0, tab=both, rotation="axis",
+        )),
+        (wood_member_id(prefix, "wood"), _wood_block(
+            wood_member_id(prefix, "wood"), "cube",
+            {"top": log_side, "side": log_side, "bottom": log_side},
+            2.0, tab=both, rotation="axis",
+        )),
+        (wood_member_id(prefix, "planks"), _wood_block(
+            wood_member_id(prefix, "planks"), "cube",
+            {"top": planks, "side": planks, "bottom": planks},
+            2.0,
+        )),
+        (wood_member_id(prefix, "planks_slab"), _wood_block(
+            wood_member_id(prefix, "planks_slab"), "slab",
+            {"top": planks, "side": planks, "bottom": planks},
+            1.0,
+        )),
+        (wood_member_id(prefix, "planks_vertical_slab"), _wood_block(
+            wood_member_id(prefix, "planks_vertical_slab"), "vertical_slab",
+            {"top": planks, "side": planks, "bottom": planks},
+            1.0, full_block=wood_member_id(prefix, "planks"),
+        )),
+        (wood_member_id(prefix, "planks_stairs"), _wood_block(
+            wood_member_id(prefix, "planks_stairs"), "stairs",
+            {"top": planks, "side": planks, "bottom": planks},
+            2.0,
+        )),
+        (wood_member_id(prefix, "vertical_planks"), _wood_block(
+            wood_member_id(prefix, "vertical_planks"), "cube",
+            {"top": vertical, "side": vertical, "bottom": vertical},
+            2.0,
+        )),
+        (wood_member_id(prefix, "vertical_planks_slab"), _wood_block(
+            wood_member_id(prefix, "vertical_planks_slab"), "slab",
+            {"top": vertical, "side": vertical, "bottom": vertical},
+            2.0,
+        )),
+        (wood_member_id(prefix, "vertical_planks_vertical_slab"), _wood_block(
+            wood_member_id(prefix, "vertical_planks_vertical_slab"), "vertical_slab",
+            {"top": vertical, "side": vertical, "bottom": vertical},
+            2.0, full_block=wood_member_id(prefix, "vertical_planks"),
+        )),
+        (wood_member_id(prefix, "vertical_planks_stairs"), _wood_block(
+            wood_member_id(prefix, "vertical_planks_stairs"), "stairs",
+            {"top": vertical, "side": vertical, "bottom": vertical},
+            2.0,
+        )),
+        (wood_member_id(prefix, "crafting_table"), _wood_block(
+            wood_member_id(prefix, "crafting_table"), "cube",
+            {
+                "up": table_top,
+                "down": log_top,
+                "north": table_front,
+                "south": table_front,
+                "east": table_side,
+                "west": table_side,
+            },
+            2.5, station="crafting_table",
+        )),
+    ]
+    extra: dict[str, dict] = {}
+    for asset_id, block in pieces:
+        tab = block["tab"]
+        extra[f"blocks/{asset_id}.json"] = block
+        extra[f"items/{asset_id}.json"] = _place_item(asset_id, tab)
+        extra[f"loot/blocks/{asset_id}.json"] = _loot_table(
+            [{"type": "item", "name": asset_id, "count": 1}]
+        )
+    stick_id = wood_member_id(prefix, "stick")
+    extra[f"items/{stick_id}.json"] = {
+        "id": stick_id,
+        "lang": f"item.{stick_id}",
+        "tab": "materials",
+        "model": "flat",
+        "texture": stick,
+        "max_stack": 64,
+        "left": "none",
+        "right": "none",
+        "durability": 0,
+        "mining_level": 0,
+        "mining_speed": 1,
+        "attack": 1,
+        "food": 0,
+    }
+    door_traits = BlockTraits(tab="building", hardness=3.0, tool="axe", sound="wood", render="cutout", solid=True)
+    door_doc = Document(TILE, TILE, name=prefix, kind="door", traits=door_traits)
+    door_id = wood_member_id(prefix, "door")
+    trap_id = wood_member_id(prefix, "trapdoor")
+    door_block, door_files, door_extra = _opening_package(
+        "door",
+        door_id,
+        _part_strip((tiles["door_lower"], tiles["door_upper"], tiles["door_edge"])),
+        door_doc,
+    )
+    trap_block, trap_files, trap_extra = _opening_package(
+        "trapdoor",
+        trap_id,
+        _part_strip((tiles["trapdoor"], tiles["door_edge"])),
+        door_doc,
+    )
+    _absorb_package(files, door_files, door_block, door_extra)
+    _absorb_package(files, trap_files, trap_block, trap_extra)
+    extra[f"blocks/{door_id}.json"] = door_block
+    extra[f"blocks/{trap_id}.json"] = trap_block
+    extra.update(door_extra)
+    extra.update(trap_extra)
+    manifest = {
+        "set": "wood",
+        "id": prefix,
+        "members": [wood_member_id(prefix, key) for key, _label in WOOD_MEMBERS],
+    }
+    return manifest, files, extra
 
 
 def preview_for(
@@ -804,10 +1395,14 @@ def preview_for(
     scale: int | None = None,
     shape: str = "cube",
     stage: int = 0,
+    member: str = "",
+    faces: str = "six",
 ) -> np.ndarray:
     array = np.asarray(image, dtype=np.uint8)
+    if kind == "set":
+        return wood_preview(array, member or "log", yaw=yaw, pitch=pitch, scale=scale)
     if kind == "crop":
-        chosen = 4 if scale is None else max(1, int(scale))
+        chosen = 6 if scale is None else max(1, int(scale))
         return _cross_preview(
             read_stage(array, stage),
             yaw=yaw,
@@ -816,6 +1411,8 @@ def preview_for(
             glow_strength=0.0,
             scale=chosen,
         )
+    if kind in ("door", "trapdoor"):
+        return opening_preview(array, kind, yaw=yaw, pitch=pitch, scale=scale)
     if kind == "block":
         return block_preview(
             array,
@@ -827,6 +1424,7 @@ def preview_for(
             glow_strength=glow_strength,
             scale=scale,
             shape=shape,
+            faces=faces,
         )
     if kind == "item":
         return sprite_preview(array)
@@ -863,8 +1461,10 @@ def export_definition(
     block-game checkout.
     """
     kind = doc.kind
-    if kind not in ("block", "item", "crop"):
-        raise PublishError("Only a block, an item, or a crop exports a definition.")
+    if kind not in ("block", "item", "crop", "door", "trapdoor", "set"):
+        raise PublishError(
+            "Only a block, an item, a crop, a door, a trapdoor, or a set exports a definition."
+        )
     asset_id = sanitize_id(asset_id or doc.name)
     if not ASSET_ID.match(asset_id):
         raise PublishError(f"'{asset_id}' is not a block-game id.")
@@ -885,6 +1485,13 @@ def export_definition(
         payload, files = _block_package(asset_id, rendered, doc)
     elif kind == "crop":
         payload, files, extra_json = _crop_package(asset_id, rendered[variant_index - 1], doc)
+    elif kind in ("door", "trapdoor"):
+        payload, files, extra_json = _opening_package(kind, asset_id, rendered[variant_index - 1], doc)
+    elif kind == "set":
+        payload, files, extra_json = _wood_package(asset_id, rendered[variant_index - 1])
+        files = {f"textures/{name}": pixels for name, pixels in files.items()}
+        names = _write_definition_zip(path, f"sets/{asset_id}.json", payload, files, extra_json)
+        return ExportedDefinition(kind, asset_id, path, names, errors)
     else:
         payload, files = _item_package(
             asset_id, rendered[variant_index - 1], variant_index, count, doc.traits.tab
@@ -902,7 +1509,7 @@ def _block_package(
     files: dict[str, np.ndarray] = {}
     count = len(rendered)
     for index, image in enumerate(rendered, start=1):
-        tiles = {name: read_face(image, name) for name in BLOCK_FACE_ORIGIN}
+        tiles = resolve_cube_faces(image, doc.traits.faces)
         mapping, part = _block_textures(asset_id, tiles, index, count)
         maps.append(mapping)
         files.update(part)
@@ -923,8 +1530,19 @@ def _block_package(
         block["type"] = block_type
     if traits.shape == "vertical_slab" and traits.full_block:
         block["full_block"] = traits.full_block
+    properties: dict = {}
     if traits.shape == "fence":
-        block["properties"] = {"fence": True}
+        properties["fence"] = True
+    if traits.rotation in ("axis", "horizontal"):
+        properties["rotation"] = traits.rotation
+    if properties:
+        block["properties"] = properties
+    if traits.station:
+        block["station"] = traits.station
+        if traits.recipe_types:
+            block["recipe_types"] = traits.recipe_types.split()
+        if traits.station == "furnace" and float(traits.cook_speed) != 1.0:
+            block["cook_speed"] = _json_number(traits.cook_speed)
     if not traits.solid:
         block["solid"] = False
     if traits.gravity:

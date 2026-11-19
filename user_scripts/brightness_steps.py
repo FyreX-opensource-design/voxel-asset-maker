@@ -1,7 +1,8 @@
 """Example layer script that produces several brightness variants.
 
-Drop other .py files next to this one, or in ~/.voxel-asset-maker/scripts/,
-then use Reload scripts in the editor. Export Variant ZIP writes one
+Drop other layer scripts next to this one, or in ~/.voxel-asset-maker/scripts/.
+Game definitions go in the definitions folder beside those scripts.
+Reload in the editor picks both up. Export Variant ZIP writes one
 composited texture per count.
 """
 

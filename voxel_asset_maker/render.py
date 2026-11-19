@@ -10,7 +10,7 @@ from PIL import Image
 from . import bootstrap  # noqa: F401
 import texture_layer
 
-from .model import Document, Layer, mask_block_faces
+from .model import Document, Layer, SheetPart, mask_block_faces, refit, sheet_parts
 from .processors import (
     ProcessError,
     Processor,
@@ -48,17 +48,22 @@ def stack_variant_count(doc: Document, library: ScriptLibrary) -> int:
     return count
 
 
-def render_variant(doc: Document, export_index: int, library: ScriptLibrary) -> RenderResult:
+def render_variant(doc: Document, export_index: int, library: ScriptLibrary, definitions=None) -> RenderResult:
     """Composite every visible layer for one variant index (1-based)."""
     export_count = stack_variant_count(doc, library)
     export_index = max(1, min(int(export_index), export_count))
     sources = variant_sources(doc, library)
+    tiles = ()
+    if definitions is not None:
+        found = definitions.tiles_for(doc)
+        tiles = tuple(found) if found else ()
+    parts = sheet_parts(doc, tiles)
     acc: np.ndarray | None = None
     errors: list[str] = []
     for layer in doc.layers:
         if not layer.visible:
             continue
-        processed, error = _process_layer(layer, doc, export_index, export_count, library)
+        processed, error = _process_layer(layer, doc, export_index, export_count, library, parts)
         if error:
             errors.append(error)
         if doc.kind == "block":
@@ -110,6 +115,7 @@ def _process_layer(
     export_index: int,
     export_count: int,
     library: ScriptLibrary,
+    parts: tuple[SheetPart, ...] = (),
 ) -> tuple[np.ndarray, str | None]:
     """Run this layer's scripts from first to last. Each sees the previous result."""
     pixels = layer.pixels
@@ -120,7 +126,7 @@ def _process_layer(
             continue
         ran = True
         pixels, error = _apply_binding(
-            pixels, binding, layer, doc, export_index, export_count, library
+            pixels, binding, layer, doc, export_index, export_count, library, parts
         )
         if error:
             errors.append(error)
@@ -137,9 +143,53 @@ def _apply_binding(
     export_index: int,
     export_count: int,
     library: ScriptLibrary,
+    parts: tuple[SheetPart, ...] = (),
 ) -> tuple[np.ndarray, str | None]:
     if not library.known(binding.script_id):
         return np.array(pixels, copy=True), f"{layer.name}: missing script {binding.script_id}"
+    chosen = tuple(getattr(binding, "parts", ()) or ())
+    if not chosen or not parts:
+        return _run_script(pixels, binding, layer, doc, export_index, export_count, library, "")
+    by_id = {part.id: part for part in parts}
+    matched = [by_id[part_id] for part_id in chosen if part_id in by_id]
+    missing = [part_id for part_id in chosen if part_id not in by_id]
+    if not matched:
+        return np.array(pixels, copy=True), f"{layer.name}: none of the chosen parts are on this sheet"
+    out = np.array(pixels, copy=True)
+    notes: list[str] = []
+    for part in matched:
+        y0 = max(0, part.y)
+        x0 = max(0, part.x)
+        y1 = min(out.shape[0], part.y + part.h)
+        x1 = min(out.shape[1], part.x + part.w)
+        if y0 >= y1 or x0 >= x1:
+            notes.append(f"{layer.name}: part {part.id} is outside the layer")
+            continue
+        crop = np.array(out[y0:y1, x0:x1], copy=True)
+        rendered, error = _run_script(
+            crop, binding, layer, doc, export_index, export_count, library, part.id, x1 - x0, y1 - y0
+        )
+        if error:
+            notes.append(error)
+            continue
+        out[y0:y1, x0:x1] = refit(rendered, x1 - x0, y1 - y0)
+    if missing:
+        notes.append(f"{layer.name}: missing parts {', '.join(missing)}")
+    return out, "\n".join(notes) if notes else None
+
+
+def _run_script(
+    pixels: np.ndarray,
+    binding,
+    layer: Layer,
+    doc: Document,
+    export_index: int,
+    export_count: int,
+    library: ScriptLibrary,
+    part: str,
+    width: int | None = None,
+    height: int | None = None,
+) -> tuple[np.ndarray, str | None]:
     proc = library.get(binding.script_id)
     label = proc.label
     try:
@@ -151,9 +201,10 @@ def _apply_binding(
             variant_count=own,
             export_index=export_index,
             export_count=export_count,
-            width=doc.width,
-            height=doc.height,
+            width=int(width if width is not None else pixels.shape[1]),
+            height=int(height if height is not None else pixels.shape[0]),
             layer_name=layer.name,
+            part=part,
         )
         image = array_to_image(pixels)
         output = proc.apply(image, binding.params, context)
@@ -163,7 +214,8 @@ def _apply_binding(
             output = output[(local - 1) % len(output)]
         return image_to_array(output), None
     except Exception as exc:
-        return np.array(pixels, copy=True), f"{layer.name} · {label}: {exc}"
+        where = f" · {part}" if part else ""
+        return np.array(pixels, copy=True), f"{layer.name} · {label}{where}: {exc}"
 
 
 def _layer_count(layer: Layer, library: ScriptLibrary) -> int:

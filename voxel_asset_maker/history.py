@@ -18,6 +18,9 @@ class Snapshot:
     name: str
     palette: list[str]
     kind: str
+    definition: str
+    asset: str
+    fields: dict
     ctm: bool
     ctm_pixels: np.ndarray
     fluor: Fluorescence
@@ -46,6 +49,9 @@ class History:
             name=doc.name,
             palette=list(doc.palette),
             kind=doc.kind,
+            definition=doc.definition,
+            asset=doc.asset,
+            fields=dict(doc.fields),
             ctm=bool(doc.ctm),
             ctm_pixels=np.array(doc.ctm_pixels, copy=True),
             fluor=doc.fluor.copy(),
@@ -119,6 +125,9 @@ def _restore(doc: Document, snap: Snapshot) -> None:
     doc.active_index = snap.active
     doc.name = snap.name
     doc.kind = snap.kind
+    doc.definition = snap.definition
+    doc.asset = snap.asset
+    doc.fields = dict(snap.fields)
     doc.ctm = bool(snap.ctm)
     doc.ctm_pixels = np.array(snap.ctm_pixels, copy=True)
     doc.fluor = snap.fluor.copy()
@@ -137,6 +146,9 @@ def _same(snap: Snapshot, doc: Document) -> bool:
         or snap.active != doc.active_index
         or snap.name != doc.name
         or snap.kind != doc.kind
+        or snap.definition != doc.definition
+        or snap.asset != doc.asset
+        or snap.fields != doc.fields
         or snap.ctm != bool(doc.ctm)
         or snap.fluor.enabled != doc.fluor.enabled
         or snap.fluor.mode != doc.fluor.mode
@@ -180,6 +192,11 @@ def _same_traits(left: BlockTraits, right: BlockTraits) -> bool:
         and left.gravity == right.gravity
         and left.light == right.light
         and left.full_block == right.full_block
+        and left.rotation == right.rotation
+        and left.station == right.station
+        and left.recipe_types == right.recipe_types
+        and left.cook_speed == right.cook_speed
+        and left.faces == right.faces
     )
 
 
@@ -193,7 +210,7 @@ def _same_crop(left: CropTraits, right: CropTraits) -> bool:
         and left.water_vertical == right.water_vertical
         and left.seeds == right.seeds
         and left.produce == right.produce
-        and left.food == right.food
+        and left.loot == right.loot
         and left.ground == right.ground
         and left.seed_tab == right.seed_tab
         and left.produce_tab == right.produce_tab
@@ -204,6 +221,11 @@ def _same_scripts(left, right) -> bool:
     if len(left) != len(right):
         return False
     for a, b in zip(left, right):
-        if a.script_id != b.script_id or a.script_path != b.script_path or a.params != b.params:
+        if (
+            a.script_id != b.script_id
+            or a.script_path != b.script_path
+            or a.params != b.params
+            or tuple(a.parts) != tuple(b.parts)
+        ):
             return False
     return True

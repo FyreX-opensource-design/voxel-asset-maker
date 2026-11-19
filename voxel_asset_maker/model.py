@@ -61,8 +61,9 @@ DEFAULT_PALETTE = (
 Color = tuple[int, int, int, int]
 
 # What a document is. Block and item export a block-game definition.
+# A set paints one strip and exports a whole family of blocks and items.
 # Further kinds can be added without changing ones that are already saved.
-ASSET_KINDS = ("texture", "block", "item", "crop")
+ASSET_KINDS = ("texture", "block", "item", "crop", "door", "trapdoor", "set", "custom")
 
 
 def asset_token(value: object, fallback: str = "") -> str:
@@ -95,6 +96,56 @@ BLOCK_FACE_ORIGIN: dict[str, tuple[int, int]] = {
     "bottom": (TILE, TILE * 2),
 }
 BLOCK_SHEET = (TILE * 4, TILE * 3)
+# How a block's textures are laid out. six is the unfolded cube. all is one
+# tile on every face. column is top, side, and bottom.
+BLOCK_FACE_MODES = ("six", "all", "column")
+
+# A door is the lower half, the upper half, and the thin edge. A trapdoor
+# is the panel and that same kind of edge. Each part is one 16×16 tile.
+DOOR_PARTS = ("lower", "upper", "edge")
+TRAPDOOR_PARTS = ("panel", "edge")
+DOOR_SHEET = (TILE * len(DOOR_PARTS), TILE)
+TRAPDOOR_SHEET = (TILE * len(TRAPDOOR_PARTS), TILE)
+
+# A wood set paints these tiles, left to right. The short label sits on the
+# canvas. The caption is the status-bar name. Log top and log side build the
+# log and the bark wood block. Planks build the planks, both slabs, the
+# stairs, and the vertical-plank versions (that texture turned a quarter
+# turn). The door edge is also the trapdoor edge.
+WOOD_PARTS: tuple[tuple[str, str, str], ...] = (
+    ("log_top", "log top", "Log top"),
+    ("log_side", "log side", "Log side"),
+    ("stick", "stick", "Stick"),
+    ("planks", "planks", "Planks"),
+    ("table_top", "table", "Table top"),
+    ("table_front", "front", "Table front"),
+    ("table_side", "t. side", "Table side"),
+    ("door_lower", "lower", "Door lower"),
+    ("door_upper", "upper", "Door upper"),
+    ("door_edge", "edge", "Door edge"),
+    ("trapdoor", "trap", "Trapdoor"),
+)
+WOOD_SHEET = (TILE * len(WOOD_PARTS), TILE)
+
+# Preview order. The id is ``{wood}_{key}``, except vertical planks, which
+# are ``vertical_{wood}_planks`` and so on, matching block-game.
+WOOD_MEMBERS: tuple[tuple[str, str], ...] = (
+    ("log", "Log"),
+    ("wood", "Wood"),
+    ("stick", "Stick"),
+    ("planks", "Planks"),
+    ("planks_slab", "Slab"),
+    ("planks_vertical_slab", "Vertical slab"),
+    ("planks_stairs", "Stairs"),
+    ("vertical_planks", "Vertical planks"),
+    ("vertical_planks_slab", "Vertical planks slab"),
+    ("vertical_planks_vertical_slab", "Vertical planks vertical slab"),
+    ("vertical_planks_stairs", "Vertical planks stairs"),
+    ("crafting_table", "Crafting table"),
+    ("door", "Door"),
+    ("trapdoor", "Trapdoor"),
+)
+SET_FAMILIES = ("wood",)
 
 # Connected textures. Sixteen tiles in a 4×4 sheet. The index is a mask of
 # which edges of the face touch the same block: up=1, down=2, left=4, right=8.
@@ -139,6 +190,23 @@ def ctm_short(index: int) -> str:
     if index & 8:
         text += "R"
     return text or "·"
+
+
+def part_at(x: int, y: int, count: int) -> int | None:
+    """Which door or trapdoor tile contains this pixel, or None off the strip."""
+    if count < 1 or not (0 <= y < TILE and 0 <= x < count * TILE):
+        return None
+    return int(x) // TILE
+
+
+def read_part(image: np.ndarray, index: int) -> np.ndarray:
+    """One 16×16 tile from a horizontal strip."""
+    out = np.zeros((TILE, TILE, 4), dtype=np.uint8)
+    origin_x = int(index) * TILE
+    height, width = image.shape[:2]
+    if origin_x + TILE <= width and TILE <= height:
+        out[:, :] = image[0:TILE, origin_x : origin_x + TILE]
+    return out
 
 
 def read_ctm(image: np.ndarray, index: int) -> np.ndarray:
@@ -202,11 +270,134 @@ def format_hex_color(color: Color) -> str:
 
 
 def face_at(x: int, y: int) -> str | None:
-    """The block face that contains this pixel, if any."""
-    for name, (origin_x, origin_y) in BLOCK_FACE_ORIGIN.items():
+    """The unfolded-cube face that contains this pixel, if any."""
+    return face_on_block(x, y, "six")
+
+
+def block_face_origins(mode: str) -> dict[str, tuple[int, int]]:
+    """Where each paintable tile sits for a block face layout."""
+    if mode == "all":
+        return {"all": (0, 0)}
+    if mode == "column":
+        return {"top": (0, 0), "side": (TILE, 0), "bottom": (TILE * 2, 0)}
+    return dict(BLOCK_FACE_ORIGIN)
+
+
+def block_sheet_size(mode: str) -> tuple[int, int]:
+    origins = block_face_origins(mode)
+    width = max(origin_x for origin_x, _origin_y in origins.values()) + TILE
+    height = max(origin_y for _origin_x, origin_y in origins.values()) + TILE
+    return width, height
+
+
+def face_on_block(x: int, y: int, mode: str) -> str | None:
+    """The tile that contains this pixel for a block face layout."""
+    for name, (origin_x, origin_y) in block_face_origins(mode).items():
         if origin_x <= x < origin_x + TILE and origin_y <= y < origin_y + TILE:
             return name
     return None
+
+
+def _tile_at(image: np.ndarray, origin_x: int, origin_y: int) -> np.ndarray:
+    out = np.zeros((TILE, TILE, 4), dtype=np.uint8)
+    height, width = image.shape[:2]
+    if origin_y < height and origin_x < width:
+        patch = image[origin_y : origin_y + TILE, origin_x : origin_x + TILE]
+        out[: patch.shape[0], : patch.shape[1]] = patch
+    return out
+
+
+def resolve_cube_faces(image: np.ndarray, mode: str) -> dict[str, np.ndarray]:
+    """The six cube faces, however the sheet is laid out."""
+    array = np.asarray(image, dtype=np.uint8)
+    if mode == "all":
+        tile = _tile_at(array, 0, 0)
+        return {name: np.array(tile, copy=True) for name in BLOCK_FACE_ORIGIN}
+    if mode == "column":
+        top = _tile_at(array, 0, 0)
+        side = _tile_at(array, TILE, 0)
+        bottom = _tile_at(array, TILE * 2, 0)
+        faces = {name: np.array(side, copy=True) for name in BLOCK_FACE_ORIGIN}
+        faces["top"] = top
+        faces["bottom"] = bottom
+        return faces
+    return {name: read_face(array, name) for name in BLOCK_FACE_ORIGIN}
+
+
+def expand_block_sheet(image: np.ndarray, mode: str) -> np.ndarray:
+    """Lay one texture or a column out onto the unfolded cube."""
+    if mode not in ("all", "column"):
+        array = np.asarray(image, dtype=np.uint8)
+        if array.shape[1] == BLOCK_SHEET[0] and array.shape[0] == BLOCK_SHEET[1]:
+            return np.array(array, copy=True)
+        return block_sheet_from_image(array)
+    sheet = np.zeros((BLOCK_SHEET[1], BLOCK_SHEET[0], 4), dtype=np.uint8)
+    for name, tile in resolve_cube_faces(image, mode).items():
+        write_face(sheet, name, tile)
+    return sheet
+
+
+def relayout_block_pixels(pixels: np.ndarray, old: str, new: str, shape: str = "cube") -> np.ndarray:
+    """Move painted faces from one block layout onto another."""
+    old = old if old in BLOCK_FACE_MODES else "six"
+    new = new if new in BLOCK_FACE_MODES else "six"
+    width, height = block_sheet_size(new)
+    if old == new and pixels.shape[1] == width and pixels.shape[0] == height:
+        return np.array(pixels, copy=True)
+    faces = resolve_cube_faces(pixels, old)
+    sheet = np.zeros((height, width, 4), dtype=np.uint8)
+    if new == "all":
+        if old == "column":
+            tile = faces["north"]
+        elif shape == "cross":
+            tile = faces["south"]
+        else:
+            tile = faces["top"]
+        sheet[:, :] = tile
+        return sheet
+    if new == "column":
+        side = faces["south"] if shape == "cross" else faces["north"]
+        sheet[0:TILE, 0:TILE] = faces["top"]
+        sheet[0:TILE, TILE : TILE * 2] = side
+        sheet[0:TILE, TILE * 2 : TILE * 3] = faces["bottom"]
+        return sheet
+    for name, tile in faces.items():
+        write_face(sheet, name, tile)
+    return sheet
+
+
+def remap_block_parts(parts: tuple[str, ...] | list[str], mode: str) -> tuple[str, ...]:
+    """Keep a script's part list pointed at tiles that exist in this layout."""
+    if not parts:
+        return ()
+    mode = mode if mode in BLOCK_FACE_MODES else "six"
+    if mode == "all":
+        return ("all",)
+    chosen: list[str] = []
+
+    def add(name: str) -> None:
+        if name not in chosen:
+            chosen.append(name)
+
+    if mode == "column":
+        for part in parts:
+            if part in ("top", "bottom", "side"):
+                add(part)
+            elif part in ("north", "south", "east", "west", "all"):
+                add("side")
+        return tuple(chosen)
+    for part in parts:
+        if part == "all":
+            names = list(BLOCK_FACE_ORIGIN)
+        elif part == "side":
+            names = ["north", "south", "east", "west"]
+        elif part in BLOCK_FACE_ORIGIN:
+            names = [part]
+        else:
+            names = []
+        for name in names:
+            add(name)
+    return tuple(chosen)
 
 
 def stage_at(x: int, y: int, stages: int) -> int | None:
@@ -329,14 +520,71 @@ def refit(pixels: np.ndarray, width: int, height: int, anchor: str = "topleft") 
     return new
 
 
+@dataclass(frozen=True)
+class SheetPart:
+    """One paintable cell a layer script can be limited to."""
+
+    id: str
+    label: str
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+def sheet_parts(doc: Document, tiles: tuple | list = ()) -> tuple[SheetPart, ...]:
+    """Named cells on this sheet. A plain texture or item has none.
+
+    ``tiles`` supplies a custom definition's cells. Built-in sheets use
+    their own layout.
+    """
+    if doc.kind == "custom":
+        parts: list[SheetPart] = []
+        for tile in tiles:
+            parts.append(
+                SheetPart(
+                    str(getattr(tile, "id", "")),
+                    str(getattr(tile, "label", "") or getattr(tile, "id", "")),
+                    int(getattr(tile, "x", 0)),
+                    int(getattr(tile, "y", 0)),
+                    int(getattr(tile, "w", TILE)),
+                    int(getattr(tile, "h", TILE)),
+                )
+            )
+        return tuple(part for part in parts if part.id and part.w > 0 and part.h > 0)
+    if doc.kind == "set":
+        return tuple(
+            SheetPart(key, label, index * TILE, 0, TILE, TILE)
+            for index, (key, label, _caption) in enumerate(WOOD_PARTS)
+        )
+    if doc.kind == "door":
+        return tuple(SheetPart(name, name, index * TILE, 0, TILE, TILE) for index, name in enumerate(DOOR_PARTS))
+    if doc.kind == "trapdoor":
+        return tuple(
+            SheetPart(name, name, index * TILE, 0, TILE, TILE) for index, name in enumerate(TRAPDOOR_PARTS)
+        )
+    if doc.kind == "crop":
+        return tuple(
+            SheetPart(str(index + 1), str(index + 1), index * TILE, 0, TILE, TILE)
+            for index in range(doc.crop.stages)
+        )
+    if doc.kind == "block":
+        return tuple(
+            SheetPart(name, name, origin_x, origin_y, TILE, TILE)
+            for name, (origin_x, origin_y) in block_face_origins(doc.traits.faces).items()
+        )
+    return ()
+
+
 @dataclass
 class ScriptBinding:
     script_id: str = "none"
     params: dict[str, Any] = field(default_factory=dict)
     script_path: str = ""
+    parts: tuple[str, ...] = ()
 
     def copy(self) -> ScriptBinding:
-        return ScriptBinding(self.script_id, deepcopy(self.params), self.script_path)
+        return ScriptBinding(self.script_id, deepcopy(self.params), self.script_path, tuple(self.parts))
 
 
 @dataclass
@@ -433,6 +681,8 @@ class Fluorescence:
 
 
 BLOCK_SHAPES = ("cube", "slab", "vertical_slab", "stairs", "fence", "wall", "cross")
+BLOCK_ROTATIONS = ("", "axis", "horizontal")
+BLOCK_STATIONS = ("", "crafting_table", "furnace")
 BLOCK_TABS = ("building", "natural", "machines")
 BLOCK_TOOLS = ("none", "pickaxe", "axe", "shovel")
 BLOCK_SOUNDS = ("stone", "wood", "grass", "dirt", "gravel", "soil")
@@ -445,6 +695,16 @@ SHAPE_LABELS = {
     "fence": "Fence",
     "wall": "Wall",
     "cross": "Plant",
+}
+ROTATION_LABELS = {
+    "": "None",
+    "axis": "Axis",
+    "horizontal": "Horizontal",
+}
+STATION_LABELS = {
+    "": "None",
+    "crafting_table": "Crafting table",
+    "furnace": "Furnace",
 }
 
 
@@ -463,6 +723,11 @@ class BlockTraits:
     gravity: bool = False
     light: int = 0
     full_block: str = ""
+    rotation: str = ""
+    station: str = ""
+    recipe_types: str = ""
+    cook_speed: float = 1.0
+    faces: str = "six"
 
     def __post_init__(self) -> None:
         self.shape = self.shape if self.shape in BLOCK_SHAPES else "cube"
@@ -476,6 +741,11 @@ class BlockTraits:
         self.solid = bool(self.solid)
         self.gravity = bool(self.gravity)
         self.full_block = asset_token(self.full_block, "")
+        self.rotation = self.rotation if self.rotation in BLOCK_ROTATIONS else ""
+        self.station = self.station if self.station in BLOCK_STATIONS else ""
+        self.recipe_types = asset_token_list(self.recipe_types, "")
+        self.cook_speed = round(float(np.clip(float(self.cook_speed), 0.25, 16.0)), 2)
+        self.faces = self.faces if self.faces in BLOCK_FACE_MODES else "six"
 
     def copy(self) -> BlockTraits:
         return BlockTraits(
@@ -490,7 +760,66 @@ class BlockTraits:
             self.gravity,
             self.light,
             self.full_block,
+            self.rotation,
+            self.station,
+            self.recipe_types,
+            self.cook_speed,
+            self.faces,
         )
+
+
+@dataclass(frozen=True)
+class LootDrop:
+    """One entry in a crop's ripe loot table.
+
+    An empty item means the produce on the first row and the seeds on the
+    second. ``chance`` is 0 to 1; 1 always drops.
+    """
+
+    item: str = ""
+    minimum: int = 1
+    maximum: int = 1
+    chance: float = 1.0
+
+
+DEFAULT_CROP_LOOT = (
+    LootDrop(),
+    LootDrop(maximum=2),
+)
+
+
+def normalize_loot(raw: object) -> tuple[LootDrop, ...]:
+    """Turn a saved list, or a row of drops, into clamped loot entries."""
+    if raw is None:
+        return DEFAULT_CROP_LOOT
+    if isinstance(raw, LootDrop):
+        raw = (raw,)
+    if not isinstance(raw, (list, tuple)):
+        return DEFAULT_CROP_LOOT
+    drops: list[LootDrop] = []
+    for entry in raw:
+        if isinstance(entry, LootDrop):
+            item, minimum, maximum, chance = entry.item, entry.minimum, entry.maximum, entry.chance
+        elif isinstance(entry, dict):
+            minimum = entry.get("minimum", entry.get("min", 1))
+            maximum = entry.get("maximum", entry.get("max", minimum))
+            item = entry.get("item", entry.get("name", ""))
+            chance = entry.get("chance", 1.0)
+        else:
+            continue
+        try:
+            low = int(minimum)
+            high = int(maximum)
+            odds = float(chance)
+        except (TypeError, ValueError):
+            continue
+        low = int(np.clip(low, 1, 64))
+        high = int(np.clip(high, 1, 64))
+        if high < low:
+            low, high = high, low
+        odds = round(float(np.clip(odds, 0.0, 1.0)), 2)
+        drops.append(LootDrop(asset_token(str(item or ""), ""), low, high, odds))
+    return tuple(drops)
 
 
 @dataclass
@@ -498,7 +827,8 @@ class CropTraits:
     """Fields written into a block-game crop definition.
 
     A crop is a row of plant sprites, one per growth stage, plus the soil
-    it can root in. Stage blocks are named ``{id}_0`` onward.
+    it can root in. Stage blocks are named ``{id}_0`` onward. ``loot`` is
+    what a ripe plant drops. An unripe plant drops one seed.
     """
 
     stages: int = 4
@@ -509,10 +839,10 @@ class CropTraits:
     water_vertical: int = 1
     seeds: str = ""
     produce: str = ""
-    food: int = 0
     ground: str = "farmland"
     seed_tab: str = "natural"
     produce_tab: str = "materials"
+    loot: tuple[LootDrop, ...] | None = None
 
     def __post_init__(self) -> None:
         self.stages = int(np.clip(int(self.stages), 2, 16))
@@ -525,10 +855,10 @@ class CropTraits:
         self.water_vertical = int(np.clip(int(self.water_vertical), 0, 8))
         self.seeds = asset_token(self.seeds, "")
         self.produce = asset_token(self.produce, "")
-        self.food = int(np.clip(int(self.food), 0, 20))
         self.ground = asset_token_list(self.ground, "farmland")
         self.seed_tab = asset_token(self.seed_tab, "natural")
         self.produce_tab = asset_token(self.produce_tab, "materials")
+        self.loot = normalize_loot(self.loot)
 
     def copy(self) -> CropTraits:
         return CropTraits(
@@ -540,10 +870,10 @@ class CropTraits:
             self.water_vertical,
             self.seeds,
             self.produce,
-            self.food,
             self.ground,
             self.seed_tab,
             self.produce_tab,
+            self.loot,
         )
 
 
@@ -556,6 +886,10 @@ class Document:
     active_index: int = 0
     palette: list[str] = field(default_factory=list)
     kind: str = "texture"
+    family: str = ""
+    definition: str = ""
+    asset: str = ""
+    fields: dict[str, Any] = field(default_factory=dict)
     ctm: bool = False
     ctm_pixels: np.ndarray = field(default_factory=lambda: empty_pixels(*CTM_SHEET))
     fluor: Fluorescence = field(default_factory=Fluorescence)
@@ -564,6 +898,10 @@ class Document:
 
     def __post_init__(self) -> None:
         self.kind = (self.kind or "texture").strip().lower() or "texture"
+        self.family = asset_token(self.family, "")
+        self.definition = asset_token(self.definition, "")
+        self.asset = asset_token(self.asset, "")
+        self.fields = _plain_fields(self.fields)
         if not isinstance(self.crop, CropTraits):
             self.crop = CropTraits()
         else:
@@ -571,7 +909,19 @@ class Document:
         if self.kind == "crop":
             self.width = self.crop.stages * TILE
             self.height = TILE
+            self.family = ""
+            self._clear_definition()
+        elif self.kind == "set":
+            if self.family not in SET_FAMILIES:
+                self.family = "wood"
+            self.width, self.height = WOOD_SHEET
+            self._clear_definition()
+        elif self.kind == "custom":
+            self.family = ""
+            self.width, self.height = validate_size(self.width, self.height)
         else:
+            self.family = ""
+            self._clear_definition()
             self.width, self.height = validate_size(self.width, self.height)
         if not self.name.strip():
             self.name = "texture"
@@ -598,6 +948,17 @@ class Document:
         if not isinstance(self.traits, BlockTraits):
             self.traits = BlockTraits()
 
+    def _clear_definition(self) -> None:
+        self.definition = ""
+        self.asset = ""
+        self.fields = {}
+
     @property
     def active_layer(self) -> Layer:
         return self.layers[self.active_index]
+
+
+def _plain_fields(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): value for key, value in raw.items() if type(value) in (str, int, float, bool)}

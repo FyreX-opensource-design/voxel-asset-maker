@@ -51,6 +51,10 @@ def save_project(doc: Document, path: Path) -> None:
         "format": PROJECT_FORMAT,
         "name": doc.name,
         "kind": doc.kind,
+        "set": doc.family,
+        "definition": doc.definition,
+        "asset": doc.asset,
+        "fields": dict(doc.fields),
         "width": doc.width,
         "height": doc.height,
         "active": doc.active_index,
@@ -76,6 +80,11 @@ def save_project(doc: Document, path: Path) -> None:
             "gravity": bool(doc.traits.gravity),
             "light": int(doc.traits.light),
             "full_block": doc.traits.full_block,
+            "rotation": doc.traits.rotation,
+            "station": doc.traits.station,
+            "recipe_types": doc.traits.recipe_types,
+            "cook_speed": float(doc.traits.cook_speed),
+            "faces": doc.traits.faces,
         },
         "crop": {
             "stages": int(doc.crop.stages),
@@ -86,7 +95,15 @@ def save_project(doc: Document, path: Path) -> None:
             "water_vertical": int(doc.crop.water_vertical),
             "seeds": doc.crop.seeds,
             "produce": doc.crop.produce,
-            "food": int(doc.crop.food),
+            "loot": [
+                {
+                    "item": drop.item,
+                    "min": int(drop.minimum),
+                    "max": int(drop.maximum),
+                    "chance": float(drop.chance),
+                }
+                for drop in doc.crop.loot
+            ],
             "ground": doc.crop.ground,
             "seed_tab": doc.crop.seed_tab,
             "produce_tab": doc.crop.produce_tab,
@@ -158,6 +175,10 @@ def load_project(path: Path) -> Document:
         name=str(payload.get("name") or path.stem),
         layers=layers,
         kind=str(payload.get("kind") or "texture"),
+        family=str(payload.get("set") or ""),
+        definition=str(payload.get("definition") or ""),
+        asset=str(payload.get("asset") or ""),
+        fields=payload.get("fields") if isinstance(payload.get("fields"), dict) else {},
         active_index=int(payload.get("active") or 0),
         palette=[str(color) for color in payload.get("palette") or []],
         ctm=bool(payload.get("ctm", False)),
@@ -195,15 +216,15 @@ def layer_pixels_from_image(path: Path, width: int, height: int) -> np.ndarray:
     return refit(src, width, height)
 
 
-def export_png(doc: Document, path: Path, variant_index: int, library: ScriptLibrary) -> list[str]:
+def export_png(doc: Document, path: Path, variant_index: int, library: ScriptLibrary, definitions=None) -> list[str]:
     path = Path(path)
-    result = render_variant(doc, variant_index, library)
+    result = render_variant(doc, variant_index, library, definitions)
     path.parent.mkdir(parents=True, exist_ok=True)
     result.image.save(path, format="PNG")
     return result.errors
 
 
-def export_variant_zip(doc: Document, path: Path, library: ScriptLibrary) -> tuple[list[str], list[str]]:
+def export_variant_zip(doc: Document, path: Path, library: ScriptLibrary, definitions=None) -> tuple[list[str], list[str]]:
     """Write one composited PNG per variant, plus a manifest."""
     path = Path(path)
     count = stack_variant_count(doc, library)
@@ -214,7 +235,7 @@ def export_variant_zip(doc: Document, path: Path, library: ScriptLibrary) -> tup
     tmp = path.with_name(path.name + ".tmp")
     with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for index in range(1, count + 1):
-            result = render_variant(doc, index, library)
+            result = render_variant(doc, index, library, definitions)
             if index == 1:
                 errors.extend(result.errors)
             filename = f"{base}.png" if count == 1 else f"{base}_{index}.png"
@@ -253,7 +274,10 @@ def export_variant_zip(doc: Document, path: Path, library: ScriptLibrary) -> tup
 def _script_dict(binding: ScriptBinding | None) -> dict:
     if binding is None or binding.script_id == "none":
         return {"id": "none", "path": "", "params": {}}
-    return {"id": binding.script_id, "path": binding.script_path, "params": binding.params}
+    body = {"id": binding.script_id, "path": binding.script_path, "params": binding.params}
+    if binding.parts:
+        body["parts"] = list(binding.parts)
+    return body
 
 
 def _scripts_from_entry(entry: dict) -> list[ScriptBinding]:
@@ -267,10 +291,20 @@ def _scripts_from_entry(entry: dict) -> list[ScriptBinding]:
 
 
 def _binding_from_dict(raw: dict) -> ScriptBinding:
+    listed = raw.get("parts") or []
+    if isinstance(listed, str):
+        listed = listed.replace(",", " ").split()
+    parts: list[str] = []
+    if isinstance(listed, (list, tuple)):
+        for item in listed:
+            token = str(item).strip()
+            if token and token not in parts:
+                parts.append(token)
     return ScriptBinding(
         script_id=str(raw.get("id") or "none"),
         params=dict(raw.get("params") or {}),
         script_path=str(raw.get("path") or ""),
+        parts=tuple(parts),
     )
 
 
@@ -290,8 +324,8 @@ def _crop_from_payload(raw: object) -> CropTraits:
         water_vertical=int(raw.get("water_vertical", 1)),
         seeds=str(raw.get("seeds") or ""),
         produce=str(raw.get("produce") or ""),
-        food=int(raw.get("food", 0)),
         ground=str(raw.get("ground") or "farmland"),
+        loot=raw.get("loot") if isinstance(raw.get("loot"), list) else None,
         seed_tab=str(raw.get("seed_tab") or "natural"),
         produce_tab=str(raw.get("produce_tab") or "materials"),
     )
@@ -312,6 +346,11 @@ def _traits_from_payload(raw: object) -> BlockTraits:
         gravity=bool(raw.get("gravity", False)),
         light=int(raw.get("light", 0)),
         full_block=str(raw.get("full_block") or ""),
+        rotation=str(raw.get("rotation") or ""),
+        station=str(raw.get("station") or ""),
+        recipe_types=str(raw.get("recipe_types") or ""),
+        cook_speed=float(raw.get("cook_speed", 1.0)),
+        faces=str(raw.get("faces") or "six"),
     )
 
 

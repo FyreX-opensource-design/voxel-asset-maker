@@ -1547,8 +1547,15 @@ def _block_package(
         block["solid"] = False
     if traits.gravity:
         block["gravity"] = True
-    if traits.light:
-        block["light"] = int(traits.light)
+    if any(traits.light):
+        red, green, blue, ultraviolet, infrared = traits.light
+        block["light"] = {
+            "r": int(red),
+            "g": int(green),
+            "b": int(blue),
+            "uv": int(ultraviolet),
+            "ir": int(infrared),
+        }
     if traits.render != "solid":
         block["render"] = traits.render
     if doc.ctm:

@@ -701,6 +701,46 @@ ROTATION_LABELS = {
     "axis": "Axis",
     "horizontal": "Horizontal",
 }
+
+
+def light_channels(value: Any) -> tuple[int, int, int, int, int]:
+    """Red, green, blue, ultraviolet, and infrared, each from 0 to 15.
+
+    A single number fills every channel, which is how an older block file
+    stored one light level.
+    """
+
+    def clamp(number: Any) -> int:
+        try:
+            level = int(number)
+        except (TypeError, ValueError):
+            level = 0
+        return max(0, min(15, level))
+
+    if isinstance(value, bool):
+        return (0, 0, 0, 0, 0)
+    if isinstance(value, (int, float)):
+        level = clamp(value)
+        return (level, level, level, level, level)
+    if isinstance(value, dict):
+        return (
+            clamp(value.get("r", value.get("red", 0))),
+            clamp(value.get("g", value.get("green", 0))),
+            clamp(value.get("b", value.get("blue", 0))),
+            clamp(value.get("uv", 0)),
+            clamp(value.get("ir", value.get("infrared", 0))),
+        )
+    if isinstance(value, (list, tuple)):
+        if len(value) >= 5:
+            return tuple(clamp(value[index]) for index in range(5))  # type: ignore[return-value]
+        if len(value) == 3:
+            return (clamp(value[0]), clamp(value[1]), clamp(value[2]), 0, 0)
+        if len(value) == 1:
+            level = clamp(value[0])
+            return (level, level, level, level, level)
+    return (0, 0, 0, 0, 0)
+
+
 STATION_LABELS = {
     "": "None",
     "crafting_table": "Crafting table",
@@ -721,7 +761,7 @@ class BlockTraits:
     render: str = "solid"
     solid: bool = True
     gravity: bool = False
-    light: int = 0
+    light: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0)
     full_block: str = ""
     rotation: str = ""
     station: str = ""
@@ -737,7 +777,7 @@ class BlockTraits:
         self.render = self.render if self.render in BLOCK_RENDERS else "solid"
         self.hardness = round(float(np.clip(float(self.hardness), 0.0, 100.0)), 2)
         self.mining_level = int(np.clip(int(self.mining_level), 0, 4))
-        self.light = int(np.clip(int(self.light), 0, 15))
+        self.light = light_channels(self.light)
         self.solid = bool(self.solid)
         self.gravity = bool(self.gravity)
         self.full_block = asset_token(self.full_block, "")

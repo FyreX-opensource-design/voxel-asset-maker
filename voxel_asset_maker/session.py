@@ -767,6 +767,10 @@ class Session:
 
     # --- painting -----------------------------------------------------------
 
+    @property
+    def painting(self) -> bool:
+        return self._stroke is not None
+
     def pointer_down(self, x: int, y: int, button: int) -> None:
         if button not in (1, 2) or self.tool == "picker":
             if self.tool == "picker" and button in (1, 2):

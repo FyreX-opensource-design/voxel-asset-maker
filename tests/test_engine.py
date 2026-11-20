@@ -647,7 +647,7 @@ class BlockGameTests(unittest.TestCase):
             self.assertEqual(block["render"], "cutout")
             self.assertFalse(block["solid"])
             self.assertTrue(block["gravity"])
-            self.assertEqual(block["light"], 7)
+            self.assertEqual(block["light"], {"r": 7, "g": 7, "b": 7, "uv": 7, "ir": 7})
             self.assertEqual(block["full_block"], "oak_planks")
             session.set_block_trait(shape="fence", solid=True, gravity=False, light=0, render="solid")
             fenced = export_definition(session.doc, library, folder / "fence.zip")
@@ -658,12 +658,32 @@ class BlockGameTests(unittest.TestCase):
             self.assertTrue(fence_block["properties"]["fence"])
             self.assertIn("texture", fence_block["textures"])
             self.assertNotIn("solid", fence_block)
+            self.assertNotIn("light", fence_block)
+            session.set_block_trait(light=(14, 11, 4, 0, 10))
+            torch = export_definition(session.doc, library, folder / "torch.zip")
+            with zipfile.ZipFile(torch.path) as archive:
+                torch_block = json.loads(archive.read("oak.json"))
+            self.assertEqual(
+                torch_block["light"],
+                {"r": 14, "g": 11, "b": 4, "uv": 0, "ir": 10},
+            )
             project = folder / "oak.vam"
             save_project(session.doc, project)
             loaded = load_project(project)
             self.assertEqual(loaded.traits.shape, "fence")
             self.assertEqual(loaded.traits.sound, "wood")
             self.assertEqual(loaded.traits.full_block, "oak_planks")
+            self.assertEqual(loaded.traits.light, (14, 11, 4, 0, 10))
+            with zipfile.ZipFile(project) as archive:
+                stored = {name: archive.read(name) for name in archive.namelist()}
+            payload = json.loads(stored["project.json"])
+            payload["block"]["light"] = 7
+            stored["project.json"] = json.dumps(payload).encode()
+            with zipfile.ZipFile(project, "w") as archive:
+                for name, data in stored.items():
+                    archive.writestr(name, data)
+            migrated = load_project(project)
+            self.assertEqual(migrated.traits.light, (7, 7, 7, 7, 7))
 
     def test_plant_cross_and_arbitrary_sound(self) -> None:
         tile = np.zeros((16, 16, 4), dtype=np.uint8)

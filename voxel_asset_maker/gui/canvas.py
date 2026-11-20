@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QEventPoint, QFont, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 from .images import numpy_to_qimage
@@ -27,6 +27,7 @@ class CanvasWidget(QWidget):
         super().__init__(parent)
         self.setObjectName("canvas")
         self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.setMinimumSize(240, 240)
         self._pixels: np.ndarray | None = None
@@ -42,6 +43,7 @@ class CanvasWidget(QWidget):
         self._space = False
         self._panning = False
         self._dragging = False
+        self._touch_id: int | None = None
         self._pan_origin = QPointF()
         self._pan_start = (0.0, 0.0)
         self._hover = (-1, -1)
@@ -261,7 +263,23 @@ class CanvasWidget(QWidget):
         self.zoom_by(direction, event.position())
         event.accept()
 
+    def event(self, event) -> bool:  # noqa: N802
+        kind = event.type()
+        if kind in (
+            QEvent.Type.TouchBegin,
+            QEvent.Type.TouchUpdate,
+            QEvent.Type.TouchEnd,
+            QEvent.Type.TouchCancel,
+        ):
+            self._on_touch(event)
+            event.accept()
+            return True
+        return super().event(event)
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        if self._touch_id is not None:
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.MiddleButton or (
             event.button() == Qt.MouseButton.LeftButton and self._space
         ):
@@ -276,12 +294,14 @@ class CanvasWidget(QWidget):
             return
         x, y = self.cell_at(event.position())
         self._dragging = True
-        if QGuiApplication.platformName() != "offscreen":
-            self.grabMouse()
+        self._grab_stroke()
         self.pressed.emit(x, y, button)
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._touch_id is not None:
+            event.accept()
+            return
         if self._panning:
             delta = event.position() - self._pan_origin
             self.pan_x = self._pan_start[0] + delta.x()
@@ -291,15 +311,13 @@ class CanvasWidget(QWidget):
             event.accept()
             return
         x, y = self.cell_at(event.position())
-        if (x, y) != self._hover:
-            self._hover = (x, y)
-            self.hovered.emit(x, y)
-            self.update()
-        if self._dragging:
-            self.moved.emit(x, y)
+        self._track_cell(x, y)
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._touch_id is not None:
+            event.accept()
+            return
         if self._panning and event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
             self._panning = False
             self.setCursor(Qt.CursorShape.OpenHandCursor if self._space else Qt.CursorShape.CrossCursor)
@@ -307,8 +325,7 @@ class CanvasWidget(QWidget):
             return
         if self._dragging and _button_code(event.button()):
             self._dragging = False
-            if self.mouseGrabber() is self:
-                self.releaseMouse()
+            self._release_stroke()
             x, y = self.cell_at(event.position())
             self.released.emit(x, y)
         event.accept()
@@ -326,6 +343,72 @@ class CanvasWidget(QWidget):
             event.accept()
             return
         super().keyReleaseEvent(event)
+
+    def _on_touch(self, event) -> None:
+        if event.type() == QEvent.Type.TouchCancel:
+            self._finish_touch()
+            return
+        point = self._touch_point(event)
+        if point is None:
+            return
+        x, y = self.cell_at(point.position())
+        kind = event.type()
+        if kind == QEvent.Type.TouchBegin:
+            self._touch_id = point.id()
+            self._dragging = True
+            self._grab_stroke()
+            self.pressed.emit(x, y, 1)
+            if (x, y) != self._hover:
+                self._hover = (x, y)
+                self.hovered.emit(x, y)
+            return
+        if kind == QEvent.Type.TouchEnd:
+            self._dragging = False
+            self._touch_id = None
+            self._release_stroke()
+            self.released.emit(x, y)
+            return
+        self._track_cell(x, y)
+
+    def _touch_point(self, event):
+        points = list(event.points())
+        if not points:
+            return None
+        if self._touch_id is not None:
+            for point in points:
+                if point.id() == self._touch_id:
+                    return point
+        for point in points:
+            if point.state() == QEventPoint.State.Pressed:
+                return point
+        return points[0]
+
+    def _finish_touch(self) -> None:
+        if self._dragging:
+            self._dragging = False
+            self._release_stroke()
+            self.released.emit(self._hover[0], self._hover[1])
+        self._touch_id = None
+
+    def _track_cell(self, x: int, y: int) -> None:
+        changed = (x, y) != self._hover
+        if changed:
+            self._hover = (x, y)
+        if self._dragging:
+            self.moved.emit(x, y)
+        if changed:
+            self.hovered.emit(x, y)
+            if not self._dragging:
+                self.update()
+
+    def _grab_stroke(self) -> None:
+        # Wayland grabs the pointer for popups only, and a failed grab warns on every stroke.
+        if QGuiApplication.platformName() in ("xcb", "windows", "cocoa"):
+            self.grabMouse()
+
+    def _release_stroke(self) -> None:
+        if self.mouseGrabber() is self:
+            self.releaseMouse()
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         self._hover = (-1, -1)

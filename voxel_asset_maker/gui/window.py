@@ -103,7 +103,7 @@ Noise is texture_noise. Palette noise picks one color from a set you define for 
 
 The variant slider and box under the toolbar scrub those variants in Result view. They stay on 1 until a script's Count is above 1. Noise starts at 4. Export PNG writes the variant you're viewing. Export Variant ZIP writes one composited PNG per variant, plus manifest.json. The file count is the highest Count on any script. A Noise script with Count 8 makes eight textures, and a shorter script repeats.
 
-File → New → Texture starts a free canvas. Block, item, crop, door, and trapdoor files are under File → New → Block game → Assets, and that kind stays with the file. A wood set is under File → New → Block game → Sets. It paints log top, log side, a stick, planks, the crafting table's top, front, and side, the door's lower half, upper half, and edge, and the trapdoor panel. Export writes the log, the bark wood block, the stick, planks with both slabs and stairs, the vertical-plank versions of those (the planks texture turned a quarter turn), the crafting table, the door, and the trapdoor. The door edge is the trapdoor edge too. Block unfolds the cube into six faces — top, bottom, north, south, east, and west — and drawing stays on the face you started the stroke on. Faces can instead be one texture for every side, or a column of top, side, and bottom. Item is one icon. A crop is a row of plant stages, with its grow time, water, seeds, produce, the soil it roots in, and the loot a ripe plant drops. An unripe plant drops one seed. A block can be a cube, slab, vertical slab, stairs, fence, wall, or a plant. A plant is two crossed planes, and you paint that sprite on the south face. Rotation is none, axis (a log), or horizontal (a furnace faces you). A crafting table or a furnace can name the recipe types it accepts. A door is the lower half, the upper half, and the thin edge. A trapdoor is the panel and the edge. The tab and the sound can be any name the game loads. Hardness, tool, mining level, render mode, and the other block fields are part of a block file. A block can also carry connected textures (sixteen tiles, one per neighbor mask) and fluorescence (a glow map or a flat color, with the UV levels where it fades in). Export definition writes a zip with the definition and its textures. It does not change a block-game checkout. The block preview starts looking from the southeast and turns in quarter steps, including a look at the underside.
+File → New → Texture starts a free canvas. Block, item, crop, door, and trapdoor files are under File → New → Block game → Assets, and that kind stays with the file. A wood set is under File → New → Block game → Sets. It paints log top, log side, a stick, planks, the crafting table's top, front, and side, the door's lower half, upper half, and edge, and the trapdoor panel. Export writes the log, the bark wood block, the stick, planks with both slabs and stairs, the vertical-plank versions of those (the planks texture turned a quarter turn), the crafting table, the door, and the trapdoor. The door edge is the trapdoor edge too. Block unfolds the cube into six faces — top, bottom, north, south, east, and west — and drawing stays on the face you started the stroke on. Faces can instead be one texture for every side, or a column of top, side, and bottom. Item is one icon. A crop is a row of plant stages, with its grow time, water, seeds, produce, the soil it roots in, and the loot a ripe plant drops. An unripe plant drops one seed. A block can be a cube, slab, vertical slab, stairs, fence, wall, or a plant. A plant is two crossed planes, and you paint that sprite on the south face. Rotation is none, axis (a log), or horizontal (a furnace faces you). A crafting table or a furnace can name the recipe types it accepts. A door is the lower half, the upper half, and the thin edge. A trapdoor is the panel and the edge. The tab and the sound can be any name the game loads. Hardness, tool, mining level, render mode, and the other block fields are part of a block file. Light is five channels — red, green, blue, ultraviolet, and infrared — each from 0 to 15. A block can also carry connected textures (sixteen tiles, one per neighbor mask) and fluorescence (a glow map or a flat color, with the UV levels where it fades in). Export definition writes a zip with the definition and its textures. It does not change a block-game checkout. The block preview starts looking from the southeast and turns in quarter steps, including a look at the underside.
 
 Custom script shape:
 
@@ -135,6 +135,9 @@ class MainWindow(QMainWindow):
         self.preview_pitch = 0
         self._history_widgets: set[QWidget] = set()
         self._field_widgets: set[QWidget] = set()
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._preview_while_stroking)
         self._definition_actions: list[QAction] = []
         self._palette_chips: list[PaletteChip] = []
         self.settings = QSettings("voxel-asset-maker", "VoxelAssetMaker")
@@ -634,9 +637,34 @@ class MainWindow(QMainWindow):
         self.solid_check.setToolTip("The block stops movement.")
         self.gravity_check = QCheckBox("Gravity")
         self.gravity_check.setToolTip("The block falls when nothing is under it.")
-        self.light_spin = QSpinBox()
-        self.light_spin.setRange(0, 15)
-        self.light_spin.setToolTip("Light the block gives off. 0 is none.")
+        self.light_host = QWidget()
+        light_grid = QGridLayout(self.light_host)
+        light_grid.setContentsMargins(0, 0, 0, 0)
+        light_grid.setHorizontalSpacing(8)
+        light_grid.setVerticalSpacing(2)
+        self.light_spins: dict[str, QSpinBox] = {}
+        for index, (key, label, tip) in enumerate(
+            (
+                ("r", "R", "Red light, from 0 to 15."),
+                ("g", "G", "Green light, from 0 to 15."),
+                ("b", "B", "Blue light, from 0 to 15."),
+                ("uv", "UV", "Ultraviolet light, from 0 to 15. Fluorescence reacts to this."),
+                ("ir", "IR", "Infrared light, from 0 to 15."),
+            )
+        ):
+            spin = QSpinBox()
+            spin.setRange(0, 15)
+            spin.setToolTip(tip)
+            caption = QLabel(label)
+            caption.setToolTip(tip)
+            cell = QWidget()
+            cell_row = QHBoxLayout(cell)
+            cell_row.setContentsMargins(0, 0, 0, 0)
+            cell_row.setSpacing(4)
+            cell_row.addWidget(caption)
+            cell_row.addWidget(spin)
+            light_grid.addWidget(cell, index // 3, index % 3)
+            self.light_spins[key] = spin
         self.full_block_edit = QLineEdit()
         self.full_block_edit.setPlaceholderText("full_block_id")
         self.full_block_edit.setToolTip("The full block two of these vertical slabs combine into.")
@@ -664,7 +692,7 @@ class MainWindow(QMainWindow):
         fields.addRow("Mining", self.mining_spin)
         fields.addRow("Sound", self.sound_combo)
         fields.addRow("Render", self.render_combo)
-        fields.addRow("Light", self.light_spin)
+        fields.addRow("Light", self.light_host)
         fields.addRow(flags)
         fields.addRow("Full block", self.full_block_edit)
         extra.addLayout(fields)
@@ -874,7 +902,8 @@ class MainWindow(QMainWindow):
         self.render_combo.currentIndexChanged.connect(self._block_trait_changed)
         self.hardness_spin.valueChanged.connect(self._block_trait_changed)
         self.mining_spin.valueChanged.connect(self._block_trait_changed)
-        self.light_spin.valueChanged.connect(self._block_trait_changed)
+        for spin in self.light_spins.values():
+            spin.valueChanged.connect(self._block_trait_changed)
         self.solid_check.toggled.connect(self._block_trait_changed)
         self.gravity_check.toggled.connect(self._block_trait_changed)
         self.full_block_edit.textEdited.connect(self._full_block_edited)
@@ -901,7 +930,7 @@ class MainWindow(QMainWindow):
             self.render_combo,
             self.hardness_spin,
             self.mining_spin,
-            self.light_spin,
+            *self.light_spins.values(),
             self.solid_check,
             self.gravity_check,
             self.full_block_edit,
@@ -1080,7 +1109,7 @@ class MainWindow(QMainWindow):
             self.form.addRow(caption, host)
         self._loading = False
 
-    def refresh_canvas(self) -> None:
+    def refresh_canvas(self, *, live: bool = True) -> None:
         self.canvas.set_pixels(self.session.display_array())
         self.canvas.set_selection(self.session.selection, self.session.selection_offset())
         self.canvas.show_minor_grid = self.session.show_minor_grid
@@ -1127,9 +1156,14 @@ class MainWindow(QMainWindow):
                 )
         else:
             self.canvas.face_boxes = ()
-        self.update_variant_controls()
-        self.update_errors()
-        self.refresh_preview()
+        if live:
+            self.update_variant_controls()
+            self.update_errors()
+            self._preview_timer.stop()
+            self.refresh_preview()
+        elif not self._preview_timer.isActive():
+            # A block preview is slow enough that one per touch sample leaves the stroke behind the finger.
+            self._preview_timer.start(80)
         self.update_status()
 
     def update_variant_controls(self) -> None:
@@ -1221,17 +1255,25 @@ class MainWindow(QMainWindow):
         self.session.pointer_down(x, y, button)
         if self.session.tool == "picker":
             self.sync_colors()
-        self.refresh_canvas()
+        self.refresh_canvas(live=not self.session.painting)
         self.sync_title()
 
     def _pointer_move(self, x: int, y: int) -> None:
         if self.session.pointer_move(x, y):
-            self.refresh_canvas()
+            self.refresh_canvas(live=False)
 
     def _pointer_up(self, x: int, y: int) -> None:
+        self._preview_timer.stop()
         self.session.pointer_up(x, y)
         self.refresh_canvas()
         self.sync_title()
+
+    def _preview_while_stroking(self) -> None:
+        if not self.session.painting:
+            return
+        self.refresh_preview()
+        if self.session.painting and not self._preview_timer.isActive():
+            self._preview_timer.start(80)
 
     def _hovered(self, x: int, y: int) -> None:
         self._hover = (x, y)
@@ -2034,6 +2076,8 @@ class MainWindow(QMainWindow):
     # --- events -------------------------------------------------------------
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if not isinstance(watched, QWidget):
+            return super().eventFilter(watched, event)
         watched_field = watched in self._history_widgets or watched in self._field_widgets
         if event.type() == QEvent.Type.FocusIn and watched_field and not self._loading:
             self.session.begin_edit()
@@ -2404,7 +2448,8 @@ class MainWindow(QMainWindow):
         self._select_data(self.render_combo, traits.render)
         self.hardness_spin.setValue(float(traits.hardness))
         self.mining_spin.setValue(int(traits.mining_level))
-        self.light_spin.setValue(int(traits.light))
+        for spin, level in zip(self.light_spins.values(), traits.light, strict=True):
+            spin.setValue(int(level))
         self.solid_check.setChecked(bool(traits.solid))
         self.gravity_check.setChecked(bool(traits.gravity))
         self.full_block_edit.setText(traits.full_block)
@@ -2415,7 +2460,7 @@ class MainWindow(QMainWindow):
         self._show_field(self._block_fields, self.station_combo, block)
         self._show_field(self._block_fields, self.recipe_edit, block and bool(traits.station))
         self._show_field(self._block_fields, self.cook_spin, block and traits.station == "furnace")
-        self._show_field(self._block_fields, self.light_spin, block)
+        self._show_field(self._block_fields, self.light_host, block)
         self._show_field(self._block_fields, self.full_block_edit, show_full)
         self.gravity_check.setVisible(block)
         for button in self.surface_buttons.values():
@@ -2516,7 +2561,7 @@ class MainWindow(QMainWindow):
             render=str(self.render_combo.currentData() or "solid"),
             solid=self.solid_check.isChecked(),
             gravity=self.gravity_check.isChecked(),
-            light=int(self.light_spin.value()),
+            light=tuple(self.light_spins[key].value() for key in ("r", "g", "b", "uv", "ir")),
             rotation=str(self.rotation_combo.currentData() or ""),
             station=str(self.station_combo.currentData() or ""),
             recipe_types=self.recipe_edit.text(),
@@ -2923,6 +2968,12 @@ class MainWindow(QMainWindow):
                 fluor = self.session.doc.fluor
                 extras += f" Fluorescence is added at full UV, from {fluor.start} to {fluor.full}."
             traits = self.session.doc.traits
+            red, green, blue, ultraviolet, infrared = traits.light
+            if any(traits.light):
+                extras += (
+                    f" Light is red {red}, green {green}, blue {blue}, "
+                    f"ultraviolet {ultraviolet}, infrared {infrared}."
+                )
             if traits.rotation == "axis":
                 extras += " It rotates like a log."
             elif traits.rotation == "horizontal":

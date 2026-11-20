@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtGui import QColor, QImage  # noqa: E402
+from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
+from PySide6.QtGui import QColor, QEventPoint, QImage, QPointingDevice  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
@@ -210,6 +210,19 @@ class GuiTests(unittest.TestCase):
             self.assertEqual([box[0] for box in window.canvas.face_boxes], ["top", "side", "bottom"])
             window.face_mode.setCurrentIndex(window.face_mode.findData("six"))
             self.app.processEvents()
+            self.assertTrue(window.light_host.isVisible())
+            self.assertEqual(tuple(window.light_spins), ("r", "g", "b", "uv", "ir"))
+            window.light_spins["r"].setValue(14)
+            window.light_spins["g"].setValue(11)
+            window.light_spins["b"].setValue(4)
+            window.light_spins["ir"].setValue(10)
+            self.app.processEvents()
+            self.assertEqual(window.session.doc.traits.light, (14, 11, 4, 0, 10))
+            self.assertIn("ultraviolet 0", window.asset_caption.text())
+            self.assertIn("infrared 10", window.asset_caption.text())
+            for spin in window.light_spins.values():
+                spin.setValue(0)
+            self.app.processEvents()
             self.assertIn("south", window.asset_caption.text())
             pixmap = window.asset_preview.pixmap()
             self.assertIsNotNone(pixmap)
@@ -226,6 +239,7 @@ class GuiTests(unittest.TestCase):
             self.assertEqual([box[0] for box in window.canvas.face_boxes], ["lower", "upper", "edge"])
             self.assertFalse(window.rotation_combo.isVisible())
             self.assertFalse(window.face_mode.isVisible())
+            self.assertFalse(window.light_host.isVisible())
             window.session.new_document(16, 16, name="kiln", kind="block")
             window.sync_all()
             window.station_combo.setCurrentIndex(window.station_combo.findData("furnace"))
@@ -323,6 +337,66 @@ class GuiTests(unittest.TestCase):
             assert preview is not None
             self.assertFalse(preview.isNull())
         finally:
+            window.session.history.mark_clean()
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_touch_stroke_skips_the_device_filter_and_the_preview(self) -> None:
+        window = MainWindow()
+        window.session.history.mark_clean()
+        try:
+            window.session.new_document(16, 16, name="swatch", kind="texture")
+            window.sync_all()
+            device = QPointingDevice()
+            self.assertFalse(window.eventFilter(device, QEvent(QEvent.Type.TouchUpdate)))
+            previews: list[int] = []
+            window.refresh_preview = lambda: previews.append(1)  # type: ignore[method-assign]
+            canvas = window.canvas
+            canvas.pan_x = 0
+            canvas.pan_y = 0
+            canvas.zoom = 16
+
+            class _Point:
+                def __init__(self, state: QEventPoint.State, x: float) -> None:
+                    self._state = state
+                    self._pos = QPointF(x, 8)
+
+                def id(self) -> int:
+                    return 7
+
+                def state(self) -> QEventPoint.State:
+                    return self._state
+
+                def position(self) -> QPointF:
+                    return self._pos
+
+            class _Touch:
+                def __init__(self, kind: QEvent.Type, sample: _Point) -> None:
+                    self._kind = kind
+                    self._sample = sample
+
+                def type(self) -> QEvent.Type:
+                    return self._kind
+
+                def points(self) -> list[_Point]:
+                    return [self._sample]
+
+                def accept(self) -> None:
+                    return None
+
+            begin = _Touch(QEvent.Type.TouchBegin, _Point(QEventPoint.State.Pressed, 8))
+            move = _Touch(QEvent.Type.TouchUpdate, _Point(QEventPoint.State.Updated, 40))
+            end = _Touch(QEvent.Type.TouchEnd, _Point(QEventPoint.State.Released, 40))
+            self.assertTrue(canvas.event(begin))
+            self.assertTrue(canvas.event(move))
+            self.assertEqual(previews, [])
+            pixel = tuple(int(channel) for channel in window.session.doc.active_layer.pixels[0, 2])
+            self.assertEqual(pixel, (232, 232, 232, 255))
+            self.assertTrue(canvas.event(end))
+            self.assertEqual(previews, [1])
+        finally:
+            window._preview_timer.stop()
             window.session.history.mark_clean()
             window.close()
             window.deleteLater()
